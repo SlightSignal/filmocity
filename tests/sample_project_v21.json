@@ -1,0 +1,94 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true,
+   "hdr": true,
+   "color_transfer": "smpte2084"
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "a",
+       "media_id": "A",
+       "start": 0,
+       "in_": 1.0,
+       "out": 3.0,
+       "speed": 1
+      },
+      {
+       "id": "b",
+       "media_id": "B",
+       "start": 2.0,
+       "in_": 1.0,
+       "out": 3.0,
+       "speed": 1,
+       "transition_in": {
+        "type": "dissolve",
+        "duration": 1.0,
+        "align": "center"
+       }
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "clips": [
+      {
+       "id": "vt",
+       "media_id": null,
+       "start": 0,
+       "in_": 0,
+       "out": 2,
+       "speed": 1,
+       "title": {
+        "text": "VERTICAL",
+        "size": 90,
+        "vertical": true,
+        "align": "left",
+        "color": "white"
+       }
+      }
+     ]
+    }
+   ],
+   "captions": [],
+   "caption_style": {
+    "size": 58,
+    "box": true
+   },
+   "in_point": 1.0,
+   "out_point": 4.0
+  }
+ ]
+}

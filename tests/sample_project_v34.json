@@ -1,0 +1,168 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "LL": {
+   "id": "LL",
+   "name": "Light Leak",
+   "path": "synthetic://light_leak",
+   "duration": 30,
+   "width": 1080,
+   "height": 1920,
+   "fps": 0,
+   "is_image": false,
+   "has_video": true,
+   "has_audio": false,
+   "synthetic": {
+    "kind": "light_leak",
+    "intensity": 0.7
+   }
+  },
+  "GR": {
+   "id": "GR",
+   "name": "Gradient",
+   "path": "synthetic://gradient",
+   "duration": 30,
+   "width": 1080,
+   "height": 1920,
+   "fps": 0,
+   "is_image": false,
+   "has_video": true,
+   "has_audio": false,
+   "synthetic": {
+    "kind": "gradient",
+    "color": "#E8631C",
+    "color2": "#7A2E9E",
+    "color3": "#00C2A8",
+    "speed": 0.05
+   }
+  },
+  "GN": {
+   "id": "GN",
+   "name": "Grain",
+   "path": "synthetic://grain",
+   "duration": 30,
+   "width": 1080,
+   "height": 1920,
+   "fps": 0,
+   "is_image": false,
+   "has_video": true,
+   "has_audio": false,
+   "synthetic": {
+    "kind": "grain",
+    "intensity": 0.5
+   }
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "bg",
+       "media_id": "GR",
+       "start": 0,
+       "in_": 0,
+       "out": 1.5,
+       "speed": 1
+      },
+      {
+       "id": "a",
+       "media_id": "A",
+       "start": 1.5,
+       "in_": 1.0,
+       "out": 3.0,
+       "speed": 1,
+       "transition_in": {
+        "type": "glitch",
+        "duration": 0.4
+       }
+      },
+      {
+       "id": "b",
+       "media_id": "B",
+       "start": 3.5,
+       "in_": 0,
+       "out": 1.5,
+       "speed": 1,
+       "transition_in": {
+        "type": "cross_zoom",
+        "duration": 0.5
+       }
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "clips": [
+      {
+       "id": "leak",
+       "media_id": "LL",
+       "start": 1.5,
+       "in_": 0,
+       "out": 3.5,
+       "speed": 1,
+       "blend": "screen",
+       "transform": {
+        "opacity": 0.8
+       }
+      },
+      {
+       "id": "t",
+       "media_id": null,
+       "start": 0.2,
+       "in_": 0,
+       "out": 1.2,
+       "speed": 1,
+       "title": {
+        "text": "premium looks",
+        "size": 100,
+        "color": "white",
+        "uppercase": true
+       },
+       "transform": {
+        "opacity": 1
+       }
+      }
+     ]
+    }
+   ],
+   "captions": [],
+   "caption_style": {
+    "size": 58,
+    "box": true
+   },
+   "in_point": 1.0,
+   "out_point": 4.0
+  }
+ ]
+}

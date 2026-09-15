@@ -1,0 +1,158 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "a",
+       "media_id": "A",
+       "start": 0,
+       "in_": 1.0,
+       "out": 5.0,
+       "speed": 1
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "clips": [
+      {
+       "id": "g",
+       "media_id": null,
+       "start": 0.2,
+       "in_": 0,
+       "out": 3.8,
+       "speed": 1,
+       "graphic": {
+        "name": "animated",
+        "layers": [
+         {
+          "kind": "shape",
+          "shape": "rect",
+          "x": 0.06,
+          "y": 0.62,
+          "w": 0.6,
+          "h": 0.012,
+          "color": "#E8631C",
+          "opacity": 1,
+          "anim_in": {
+           "type": "wipe_left",
+           "duration": 0.6,
+           "ease": "ease_out"
+          },
+          "anim_out": {
+           "type": "fade",
+           "duration": 0.4
+          }
+         },
+         {
+          "kind": "text",
+          "text": "Built for the rider",
+          "size": 84,
+          "align": "left",
+          "valign": "center",
+          "y": -120,
+          "color": "white",
+          "shadow": true,
+          "anim_in": {
+           "type": "slide_left",
+           "duration": 0.7,
+           "delay": 0.15,
+           "ease": "back_out"
+          },
+          "anim_out": {
+           "type": "slide_right",
+           "duration": 0.5
+          }
+         },
+         {
+          "kind": "text",
+          "text": "other e-bikes weren't built for.",
+          "size": 52,
+          "align": "left",
+          "valign": "center",
+          "y": -20,
+          "color": "#F2F1EC",
+          "weight": "regular",
+          "anim_in": {
+           "type": "typewriter",
+           "duration": 1.2,
+           "delay": 0.6
+          },
+          "anim_out": {
+           "type": "fade",
+           "duration": 0.4
+          }
+         },
+         {
+          "kind": "text",
+          "text": "OPEN ROAD",
+          "size": 64,
+          "align": "right",
+          "valign": "bottom",
+          "y": -80,
+          "color": "#E8631C",
+          "glow": true,
+          "anim_in": {
+           "type": "pop",
+           "duration": 0.6,
+           "delay": 1.0,
+           "ease": "back_out"
+          },
+          "anim_out": {
+           "type": "blur_out",
+           "duration": 0.4
+          }
+         }
+        ]
+       },
+       "transform": {
+        "opacity": 1
+       }
+      }
+     ]
+    }
+   ],
+   "captions": [],
+   "caption_style": {
+    "size": 58,
+    "box": true
+   },
+   "in_point": 1.0,
+   "out_point": 4.0
+  }
+ ]
+}

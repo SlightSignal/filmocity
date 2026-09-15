@@ -1,0 +1,131 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "a",
+       "media_id": "A",
+       "start": 0,
+       "in_": 1.0,
+       "out": 4.0,
+       "speed": 1,
+       "fit": "blur_fill"
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "clips": [
+      {
+       "id": "g",
+       "media_id": null,
+       "start": 0.2,
+       "in_": 0,
+       "out": 2.8,
+       "speed": 1,
+       "graphic": {
+        "name": "card",
+        "layers": [
+         {
+          "kind": "shape",
+          "shape": "rect",
+          "x": 0.08,
+          "y": 0.62,
+          "w": 0.84,
+          "h": 0.16,
+          "radius": 28,
+          "color": "#E8631C",
+          "gradient": {
+           "to": "#7A2E9E",
+           "angle": 20
+          },
+          "shadow": true,
+          "opacity": 0.95,
+          "anim_in": {
+           "type": "rise",
+           "duration": 0.5
+          }
+         },
+         {
+          "kind": "image",
+          "path": "/tmp/footage/logo_alpha.png",
+          "x": 0.1,
+          "y": 0.64,
+          "w": 0.25,
+          "h": 0.12,
+          "fit": "contain",
+          "anim_in": {
+           "type": "pop",
+           "duration": 0.5,
+           "delay": 0.2,
+           "ease": "back_out"
+          }
+         },
+         {
+          "kind": "text",
+          "text": "Ride further.",
+          "size": 70,
+          "align": "right",
+          "valign": "center",
+          "y": 260,
+          "color": "white",
+          "shadow": true,
+          "anim_in": {
+           "type": "slide_right",
+           "duration": 0.5,
+           "delay": 0.3
+          }
+         }
+        ]
+       },
+       "transform": {
+        "opacity": 1
+       }
+      }
+     ]
+    }
+   ],
+   "captions": [],
+   "caption_style": {
+    "size": 58,
+    "box": true
+   },
+   "in_point": 1.0,
+   "out_point": 4.0
+  }
+ ]
+}

@@ -1,0 +1,229 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "m1",
+       "media_id": null,
+       "sequence_id": "mc1",
+       "multicam_angle": 0,
+       "start": 0,
+       "in_": 0,
+       "out": 1.5,
+       "speed": 1
+      },
+      {
+       "id": "m2",
+       "media_id": null,
+       "sequence_id": "mc1",
+       "multicam_angle": 1,
+       "start": 1.5,
+       "in_": 1.5,
+       "out": 3.0,
+       "speed": 1,
+       "transition_in": {
+        "type": "iris",
+        "duration": 0.5
+       }
+      },
+      {
+       "id": "rv",
+       "media_id": "A",
+       "start": 3.0,
+       "in_": 0.0,
+       "out": 2.0,
+       "speed": 0.5,
+       "reverse": true,
+       "fit": "cover",
+       "time_interpolation": "frame_blending",
+       "color": {
+        "curves_r": [
+         [
+          0,
+          0
+         ],
+         [
+          0.5,
+          0.6
+         ],
+         [
+          1,
+          1
+         ]
+        ],
+        "vibrance": 0.5,
+        "wheels": {
+         "shadows": {
+          "r": 0.1,
+          "g": 0,
+          "b": -0.1
+         }
+        }
+       },
+       "transition_in": {
+        "type": "slide_up",
+        "duration": 0.4
+       },
+       "audio_transition_in": {
+        "type": "exponential",
+        "duration": 0.5
+       },
+       "time_remap": [
+        {
+         "t": 0,
+         "v": 2.0
+        },
+        {
+         "t": 1.0,
+         "v": 0.5
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "clips": []
+    },
+    {
+     "id": "A1",
+     "kind": "audio",
+     "index": 1,
+     "muted": false,
+     "locked": false,
+     "clips": [
+      {
+       "id": "mus",
+       "media_id": "B",
+       "start": 0,
+       "in_": 0,
+       "out": 5.0,
+       "speed": 1,
+       "audio": {
+        "gain_db": -6
+       }
+      }
+     ],
+     "audio_fx": {
+      "comp": {
+       "enabled": true,
+       "threshold_db": -20,
+       "ratio": 2
+      }
+     }
+    }
+   ],
+   "captions": [],
+   "caption_style": {
+    "size": 58,
+    "box": true
+   },
+   "in_point": 1.0,
+   "out_point": 4.0,
+   "master": {
+    "audio_fx": {
+     "limiter": true
+    },
+    "gain_db": -1
+   }
+  },
+  {
+   "id": "mc1",
+   "name": "Multicam 01",
+   "multicam": true,
+   "multicam_audio_track": "A1",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "locked": false,
+     "clips": [
+      {
+       "id": "mA",
+       "media_id": "A",
+       "start": 0,
+       "in_": 0,
+       "out": 5.0,
+       "speed": 1
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "locked": false,
+     "clips": [
+      {
+       "id": "mB",
+       "media_id": "B",
+       "start": 0,
+       "in_": 0,
+       "out": 5.0,
+       "speed": 1
+      }
+     ]
+    },
+    {
+     "id": "A1",
+     "kind": "audio",
+     "index": 1,
+     "muted": false,
+     "locked": false,
+     "clips": [
+      {
+       "id": "mAa",
+       "media_id": "A",
+       "start": 0,
+       "in_": 0,
+       "out": 5.0,
+       "speed": 1
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

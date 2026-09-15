@@ -1,0 +1,172 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true,
+   "stab_trf": "/tmp/A.trf"
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "c1",
+       "media_id": "A",
+       "start": 0,
+       "in_": 1.0,
+       "out": 3.0,
+       "speed": 1,
+       "fx_stack": [
+        {
+         "type": "stabilize",
+         "params": {
+          "smoothing": 8
+         }
+        },
+        {
+         "type": "procamp",
+         "params": {
+          "saturation": 140
+         }
+        },
+        {
+         "type": "mirror",
+         "params": {
+          "axis": "horizontal"
+         }
+        },
+        {
+         "type": "drop_shadow",
+         "params": {
+          "distance": 30,
+          "softness": 10
+         }
+        },
+        {
+         "type": "posterize_time",
+         "params": {
+          "rate": 6
+         }
+        },
+        {
+         "type": "timecode",
+         "params": {
+          "size": 40
+         }
+        }
+       ],
+       "transform": {
+        "scale": 0.7
+       },
+       "afx_stack": [
+        {
+         "type": "compressor",
+         "params": {
+          "threshold_db": -20
+         }
+        },
+        {
+         "type": "reverb",
+         "params": {
+          "size": "hall"
+         }
+        }
+       ]
+      },
+      {
+       "id": "c2",
+       "media_id": "B",
+       "start": 2.0,
+       "in_": 0,
+       "out": 2.5,
+       "speed": 1,
+       "transition_in": {
+        "type": "clock",
+        "duration": 0.8
+       },
+       "fx_stack": [
+        {
+         "type": "add_noise",
+         "params": {
+          "amount": 30
+         }
+        },
+        {
+         "type": "find_edges",
+         "params": {}
+        }
+       ]
+      },
+      {
+       "id": "c3",
+       "media_id": "A",
+       "start": 3.5,
+       "in_": 0,
+       "out": 1.5,
+       "speed": 1,
+       "transition_in": {
+        "type": "barn_h",
+        "duration": 0.5
+       },
+       "fx_stack": [
+        {
+         "type": "tint",
+         "params": {
+          "black_to": "#102040",
+          "white_to": "#ffd080",
+          "amount": 80
+         }
+        },
+        {
+         "type": "vignette_fx",
+         "params": {
+          "amount": 0.7
+         }
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "clips": []
+    }
+   ],
+   "captions": [],
+   "caption_style": {
+    "size": 58,
+    "box": true
+   },
+   "in_point": 1.0,
+   "out_point": 4.0
+  }
+ ]
+}

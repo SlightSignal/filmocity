@@ -1,0 +1,168 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "c1",
+       "media_id": "A",
+       "start": 0.0,
+       "in_": 1.0,
+       "out": 4.0,
+       "speed": 1.0,
+       "transform": {
+        "scale": 1.0,
+        "opacity": 1.0
+       },
+       "audio": {
+        "gain_db": -3
+       },
+       "keyframes": {
+        "transform.scale": [
+         {
+          "t": 0,
+          "v": 1.0
+         },
+         {
+          "t": 2.5,
+          "v": 1.25
+         }
+        ],
+        "transform.x": [
+         {
+          "t": 0,
+          "v": 0
+         },
+         {
+          "t": 3,
+          "v": 120
+         }
+        ],
+        "audio.gain_db": [
+         {
+          "t": 0,
+          "v": -12
+         },
+         {
+          "t": 2,
+          "v": 0
+         }
+        ]
+       },
+       "color": {
+        "exposure": 0.3,
+        "contrast": 0.1,
+        "saturation": 0.2,
+        "temperature": 0.4,
+        "tint": 0,
+        "highlights": -0.2,
+        "shadows": 0.2
+       }
+      },
+      {
+       "id": "c2",
+       "media_id": "B",
+       "start": 2.5,
+       "in_": 0.0,
+       "out": 3.0,
+       "speed": 1.0,
+       "transform": {},
+       "transition_in": {
+        "type": "wipe_left",
+        "duration": 1.0
+       },
+       "audio": {
+        "fade_in": 0.5
+       },
+       "keyframes": {
+        "transform.opacity": [
+         {
+          "t": 0,
+          "v": 1
+         },
+         {
+          "t": 3,
+          "v": 0.3
+         }
+        ]
+       }
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "clips": [
+      {
+       "id": "t1",
+       "media_id": null,
+       "start": 0.5,
+       "in_": 0,
+       "out": 3.0,
+       "title": {
+        "text": "Filmocity v0.1",
+        "size": 110
+       },
+       "transition_in": {
+        "type": "push_left",
+        "duration": 0.6
+       }
+      }
+     ]
+    }
+   ],
+   "captions": [
+    {
+     "id": "ceea1b38",
+     "start": 0.5,
+     "end": 2.4,
+     "text": "Everyone's first bowl wobbles."
+    },
+    {
+     "id": "f0cff09f",
+     "start": 2.6,
+     "end": 5.0,
+     "text": "By 9 pm, yours won't."
+    }
+   ],
+   "caption_style": {
+    "size": 58,
+    "box": true
+   },
+   "in_point": 1.0,
+   "out_point": 4.0
+  }
+ ]
+}

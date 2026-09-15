@@ -1,0 +1,164 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "BARS": {
+   "id": "BARS",
+   "name": "Bars and Tone",
+   "path": "synthetic://bars",
+   "duration": 5,
+   "width": 1920,
+   "height": 1080,
+   "fps": 0,
+   "has_video": true,
+   "has_audio": true,
+   "synthetic": {
+    "kind": "bars",
+    "tone_hz": 1000
+   }
+  },
+  "MATTE": {
+   "id": "MATTE",
+   "name": "Color Matte",
+   "path": "synthetic://color",
+   "duration": 5,
+   "width": 1920,
+   "height": 1080,
+   "fps": 0,
+   "has_video": true,
+   "has_audio": false,
+   "synthetic": {
+    "kind": "color",
+    "color": "#E8631C"
+   }
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "b",
+       "media_id": "BARS",
+       "start": 0,
+       "in_": 0,
+       "out": 2.0,
+       "speed": 1
+      },
+      {
+       "id": "a",
+       "media_id": "A",
+       "start": 2.0,
+       "in_": 0.5,
+       "out": 3.5,
+       "speed": 1,
+       "fx_stack": [
+        {
+         "type": "track_matte",
+         "params": {
+          "track": "V2",
+          "type": "alpha"
+         }
+        }
+       ]
+      }
+     ],
+     "audio_fx": {
+      "comp": {
+       "enabled": true,
+       "threshold_db": -20,
+       "ratio": 2
+      }
+     }
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": true,
+     "clips": [
+      {
+       "id": "t",
+       "media_id": null,
+       "start": 2.0,
+       "in_": 0,
+       "out": 3.0,
+       "speed": 1,
+       "title": {
+        "text": "MATTE",
+        "size": 300,
+        "color": "white"
+       }
+      }
+     ]
+    },
+    {
+     "id": "V3",
+     "kind": "video",
+     "index": 3,
+     "muted": false,
+     "locked": false,
+     "clips": [
+      {
+       "id": "cm",
+       "media_id": "MATTE",
+       "start": 4.0,
+       "in_": 0,
+       "out": 1.0,
+       "speed": 1,
+       "transform": {
+        "opacity": 0.4
+       }
+      }
+     ]
+    }
+   ],
+   "captions": [
+    {
+     "id": "c",
+     "start": 0.5,
+     "end": 1.5,
+     "text": "VTT test"
+    }
+   ],
+   "caption_style": {
+    "size": 58,
+    "box": true
+   },
+   "in_point": 1.0,
+   "out_point": 4.0,
+   "master": {
+    "audio_fx": {
+     "limiter": true
+    },
+    "gain_db": -1
+   }
+  }
+ ]
+}

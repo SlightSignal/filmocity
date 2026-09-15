@@ -1,0 +1,91 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "c1",
+       "media_id": "A",
+       "start": 0.0,
+       "in_": 1.0,
+       "out": 4.0,
+       "speed": 1.0,
+       "transform": {
+        "scale": 1.0,
+        "opacity": 1.0
+       },
+       "audio": {
+        "gain_db": -3
+       }
+      },
+      {
+       "id": "c2",
+       "media_id": "B",
+       "start": 2.5,
+       "in_": 0.0,
+       "out": 3.0,
+       "speed": 1.0,
+       "transform": {},
+       "transition_in": {
+        "type": "dissolve",
+        "duration": 1.0
+       },
+       "audio": {
+        "fade_in": 0.5
+       }
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "clips": [
+      {
+       "id": "t1",
+       "media_id": null,
+       "start": 0.5,
+       "in_": 0,
+       "out": 3.0,
+       "title": {
+        "text": "Filmocity v0.1",
+        "size": 110
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

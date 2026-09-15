@@ -1,0 +1,175 @@
+{
+ "media": {
+  "A": {
+   "path": "/tmp/clipA.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "B": {
+   "path": "/tmp/clipB.mp4",
+   "duration": 6,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_audio": true
+  },
+  "SUB": {
+   "id": "SUB",
+   "name": "A sub",
+   "path": "/tmp/clipA.mp4",
+   "duration": 2.0,
+   "width": 1280,
+   "height": 720,
+   "fps": 30,
+   "has_video": true,
+   "has_audio": true,
+   "subclip_of": "A",
+   "sub_in": 2.0
+  }
+ },
+ "sequences": [
+  {
+   "id": "seq1",
+   "name": "Test",
+   "width": 1080,
+   "height": 1920,
+   "fps": 30,
+   "duration": null,
+   "markers": [],
+   "tracks": [
+    {
+     "id": "V1",
+     "kind": "video",
+     "index": 1,
+     "muted": false,
+     "clips": [
+      {
+       "id": "c1",
+       "media_id": "SUB",
+       "start": 0,
+       "in_": 0.0,
+       "out": 2.0,
+       "speed": 1,
+       "transform": {
+        "scale": 0.8,
+        "rotation": 15,
+        "anchor_x": -300,
+        "anchor_y": 0
+       },
+       "effects": {
+        "crop": {
+         "l": 0.1,
+         "r": 0.1
+        },
+        "blur": 1.5,
+        "vignette": 0.8
+       },
+       "color": {
+        "curves": [
+         [
+          0,
+          0
+         ],
+         [
+          0.3,
+          0.25
+         ],
+         [
+          0.7,
+          0.8
+         ],
+         [
+          1,
+          1
+         ]
+        ]
+       },
+       "audio": {
+        "gain_db": 0,
+        "pan": -0.6
+       }
+      },
+      {
+       "id": "c2",
+       "media_id": "B",
+       "start": 2.0,
+       "in_": 0,
+       "out": 2.0,
+       "speed": 1,
+       "effects": {
+        "chromakey": {
+         "enabled": true,
+         "color": "#2E6BB0",
+         "similarity": 0.25,
+         "blend": 0.1
+        },
+        "sharpen": 1.0
+       }
+      }
+     ]
+    },
+    {
+     "id": "V2",
+     "kind": "video",
+     "index": 2,
+     "muted": false,
+     "clips": [
+      {
+       "id": "g",
+       "media_id": null,
+       "start": 0.2,
+       "in_": 0,
+       "out": 3.5,
+       "speed": 1,
+       "graphic": {
+        "name": "shapes",
+        "layers": [
+         {
+          "kind": "shape",
+          "shape": "ellipse",
+          "x": 0.55,
+          "y": 0.08,
+          "w": 0.35,
+          "h": 0.2,
+          "color": "#E8631C",
+          "opacity": 0.9
+         },
+         {
+          "kind": "shape",
+          "shape": "rect",
+          "x": 0.06,
+          "y": 0.78,
+          "w": 0.5,
+          "h": 0.06,
+          "color": "#ffffff",
+          "opacity": 0.85,
+          "radius": 18
+         },
+         {
+          "kind": "text",
+          "text": "SHAPES",
+          "size": 54,
+          "align": "left",
+          "valign": "bottom",
+          "y": -160,
+          "color": "#1E2024"
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ],
+   "captions": [],
+   "caption_style": {
+    "size": 58,
+    "box": true
+   },
+   "in_point": 1.0,
+   "out_point": 4.0
+  }
+ ]
+}

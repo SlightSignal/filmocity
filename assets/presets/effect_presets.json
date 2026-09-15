@@ -1,0 +1,432 @@
+{
+ "Voice \u2014 Clean-up": {
+  "category": "Audio \u00b7 Voice",
+  "description": "High-pass, adaptive denoise, de-hum, gentle compression and presence. The default for any spoken clip.",
+  "afx_stack": [
+   {
+    "id": "p1",
+    "type": "highpass",
+    "enabled": true,
+    "params": {
+     "frequency": 90
+    }
+   },
+   {
+    "id": "p2",
+    "type": "denoise",
+    "enabled": true,
+    "params": {
+     "reduction": 12
+    }
+   },
+   {
+    "id": "p3",
+    "type": "dehummer",
+    "enabled": true,
+    "params": {
+     "frequency": 60
+    }
+   },
+   {
+    "id": "p4",
+    "type": "compressor",
+    "enabled": true,
+    "params": {
+     "threshold_db": -18,
+     "ratio": 3,
+     "attack_ms": 10,
+     "release_ms": 150,
+     "makeup_db": 3
+    }
+   },
+   {
+    "id": "p5",
+    "type": "parametric_eq",
+    "enabled": true,
+    "params": {
+     "frequency": 3000,
+     "width": 1.0,
+     "gain_db": 2
+    }
+   }
+  ],
+  "fx_stack": [],
+  "color": {},
+  "effects": {}
+ },
+ "Voice \u2014 Podcast": {
+  "category": "Audio \u00b7 Voice",
+  "description": "Warm, close radio voice: firmer compression, a little low end, brick-wall limiter at \u22121 dB.",
+  "afx_stack": [
+   {
+    "id": "p1",
+    "type": "highpass",
+    "enabled": true,
+    "params": {
+     "frequency": 80
+    }
+   },
+   {
+    "id": "p2",
+    "type": "compressor",
+    "enabled": true,
+    "params": {
+     "threshold_db": -20,
+     "ratio": 4,
+     "attack_ms": 5,
+     "release_ms": 120,
+     "makeup_db": 4
+    }
+   },
+   {
+    "id": "p3",
+    "type": "bass",
+    "enabled": true,
+    "params": {
+     "gain_db": 2,
+     "frequency": 120
+    }
+   },
+   {
+    "id": "p4",
+    "type": "limiter",
+    "enabled": true,
+    "params": {
+     "limit_db": -1
+    }
+   }
+  ],
+  "fx_stack": [],
+  "color": {},
+  "effects": {}
+ },
+ "Voice \u2014 Phone / Lo-fi": {
+  "category": "Audio \u00b7 Voice",
+  "description": "Band-limited telephone effect for inserts and B-roll VO.",
+  "afx_stack": [
+   {
+    "id": "p1",
+    "type": "highpass",
+    "enabled": true,
+    "params": {
+     "frequency": 300
+    }
+   },
+   {
+    "id": "p2",
+    "type": "lowpass",
+    "enabled": true,
+    "params": {
+     "frequency": 3400
+    }
+   },
+   {
+    "id": "p3",
+    "type": "compressor",
+    "enabled": true,
+    "params": {
+     "threshold_db": -16,
+     "ratio": 6,
+     "attack_ms": 3,
+     "release_ms": 80,
+     "makeup_db": 4
+    }
+   }
+  ],
+  "fx_stack": [],
+  "color": {},
+  "effects": {}
+ },
+ "Music \u2014 Bed": {
+  "category": "Audio \u00b7 Music",
+  "description": "Rolls off the top end and evens the dynamics so a bed sits under dialogue (pair with Auto-Duck).",
+  "afx_stack": [
+   {
+    "id": "p1",
+    "type": "lowpass",
+    "enabled": true,
+    "params": {
+     "frequency": 9000
+    }
+   },
+   {
+    "id": "p2",
+    "type": "compressor",
+    "enabled": true,
+    "params": {
+     "threshold_db": -16,
+     "ratio": 2.5,
+     "attack_ms": 20,
+     "release_ms": 250,
+     "makeup_db": 0
+    }
+   }
+  ],
+  "fx_stack": [],
+  "color": {},
+  "effects": {}
+ },
+ "Music \u2014 Loud & Wide": {
+  "category": "Audio \u00b7 Music",
+  "description": "Stereo width and a limiter for music-led cuts with no dialogue.",
+  "afx_stack": [
+   {
+    "id": "p1",
+    "type": "stereo_widen",
+    "enabled": true,
+    "params": {
+     "amount": 0.5
+    }
+   },
+   {
+    "id": "p2",
+    "type": "limiter",
+    "enabled": true,
+    "params": {
+     "limit_db": -1
+    }
+   }
+  ],
+  "fx_stack": [],
+  "color": {},
+  "effects": {}
+ },
+ "Look \u2014 Social Punch": {
+  "category": "Video \u00b7 Look",
+  "description": "Crisper, more saturated, slight vignette: reads on a phone in a feed.",
+  "fx_stack": [
+   {
+    "id": "v1",
+    "type": "unsharp_mask",
+    "enabled": true,
+    "params": {
+     "amount": 0.8,
+     "radius": 3
+    }
+   },
+   {
+    "id": "v2",
+    "type": "vignette_fx",
+    "enabled": true,
+    "params": {
+     "amount": 0.35
+    }
+   }
+  ],
+  "afx_stack": [],
+  "color": {
+   "contrast": 0.12,
+   "saturation": 0.15,
+   "vibrance": 0.2
+  },
+  "effects": {}
+ },
+ "Look \u2014 Film Soft": {
+  "category": "Video \u00b7 Look",
+  "description": "Lifted blacks, softened whites, warm tint and a touch of grain.",
+  "fx_stack": [
+   {
+    "id": "v1",
+    "type": "add_noise",
+    "enabled": true,
+    "params": {
+     "amount": 8
+    }
+   },
+   {
+    "id": "v2",
+    "type": "vignette_fx",
+    "enabled": true,
+    "params": {
+     "amount": 0.45
+    }
+   }
+  ],
+  "afx_stack": [],
+  "color": {
+   "contrast": -0.05,
+   "blacks": -0.15,
+   "whites": -0.1,
+   "saturation": -0.1,
+   "temperature": 0.08
+  },
+  "effects": {}
+ },
+ "Look \u2014 Clean Commercial": {
+  "category": "Video \u00b7 Look",
+  "description": "Neutral, bright and sharp: product and testimonial footage.",
+  "fx_stack": [
+   {
+    "id": "v1",
+    "type": "unsharp_mask",
+    "enabled": true,
+    "params": {
+     "amount": 0.5,
+     "radius": 2
+    }
+   }
+  ],
+  "afx_stack": [],
+  "color": {
+   "exposure": 0.05,
+   "contrast": 0.06,
+   "whites": 0.1,
+   "saturation": 0.05
+  },
+  "effects": {}
+ },
+ "Look \u2014 Dreamy Glow": {
+  "category": "Video \u00b7 Look",
+  "description": "Soft bloom with lifted highlights for beauty and lifestyle shots.",
+  "fx_stack": [
+   {
+    "id": "v1",
+    "type": "gaussian_blur",
+    "enabled": true,
+    "params": {
+     "blurriness": 6
+    }
+   }
+  ],
+  "afx_stack": [],
+  "color": {
+   "highlights": 0.25,
+   "saturation": 0.05
+  },
+  "effects": {}
+ },
+ "Look \u2014 Black & White Punch": {
+  "category": "Video \u00b7 Look",
+  "description": "High-contrast monochrome with sharpening.",
+  "fx_stack": [
+   {
+    "id": "v1",
+    "type": "black_white",
+    "enabled": true,
+    "params": {}
+   },
+   {
+    "id": "v2",
+    "type": "unsharp_mask",
+    "enabled": true,
+    "params": {
+     "amount": 0.6,
+     "radius": 2
+    }
+   }
+  ],
+  "afx_stack": [],
+  "color": {
+   "contrast": 0.25
+  },
+  "effects": {}
+ },
+ "Stylize \u2014 VHS": {
+  "category": "Video \u00b7 Stylize",
+  "description": "Chroma shift, noise and softness \u2014 a retro tape feel.",
+  "fx_stack": [
+   {
+    "id": "v1",
+    "type": "rgb_shift",
+    "enabled": true,
+    "params": {
+     "rh": 3,
+     "bh": -3
+    }
+   },
+   {
+    "id": "v2",
+    "type": "add_noise",
+    "enabled": true,
+    "params": {
+     "amount": 18
+    }
+   },
+   {
+    "id": "v3",
+    "type": "gaussian_blur",
+    "enabled": true,
+    "params": {
+     "blurriness": 2
+    }
+   }
+  ],
+  "afx_stack": [],
+  "color": {
+   "saturation": -0.15,
+   "contrast": -0.05
+  },
+  "effects": {}
+ },
+ "Stylize \u2014 Comic Edges": {
+  "category": "Video \u00b7 Stylize",
+  "description": "Posterised colour with detected edges for stylised inserts.",
+  "fx_stack": [
+   {
+    "id": "v1",
+    "type": "posterize",
+    "enabled": true,
+    "params": {
+     "levels": 6
+    }
+   },
+   {
+    "id": "v2",
+    "type": "unsharp_mask",
+    "enabled": true,
+    "params": {
+     "amount": 1.2,
+     "radius": 3
+    }
+   }
+  ],
+  "afx_stack": [],
+  "color": {
+   "saturation": 0.3
+  },
+  "effects": {}
+ },
+ "Utility \u2014 Privacy Blur": {
+  "category": "Video \u00b7 Utility",
+  "description": "Heavy blur for faces or plates when paired with a mask.",
+  "fx_stack": [
+   {
+    "id": "v1",
+    "type": "gaussian_blur",
+    "enabled": true,
+    "params": {
+     "blurriness": 45
+    }
+   }
+  ],
+  "afx_stack": [],
+  "color": {},
+  "effects": {}
+ },
+ "Utility \u2014 Stabilise + Sharpen": {
+  "category": "Video \u00b7 Utility",
+  "description": "Warp Stabilizer with a light sharpen to recover detail.",
+  "fx_stack": [
+   {
+    "id": "v1",
+    "type": "stabilize",
+    "enabled": true,
+    "params": {
+     "smoothing": 15
+    }
+   },
+   {
+    "id": "v2",
+    "type": "unsharp_mask",
+    "enabled": true,
+    "params": {
+     "amount": 0.4,
+     "radius": 2
+    }
+   }
+  ],
+  "afx_stack": [],
+  "color": {},
+  "effects": {}
+ }
+}

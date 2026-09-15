@@ -1,0 +1,153 @@
+{
+ "Reels / TikTok 9:16": {
+  "format": "h264",
+  "crf": 18,
+  "loudnorm": true,
+  "outputs": [
+   "1080x1920"
+  ],
+  "platform": "reels"
+ },
+ "Feed 4:5 + Square": {
+  "format": "h264",
+  "crf": 18,
+  "loudnorm": true,
+  "outputs": [
+   "1080x1350",
+   "1080x1080"
+  ]
+ },
+ "YouTube 1080p": {
+  "format": "h264",
+  "crf": 17,
+  "loudnorm": true,
+  "chapters": true,
+  "incremental": true,
+  "platform": "youtube"
+ },
+ "YouTube 4K": {
+  "format": "h264",
+  "bitrate": "45M",
+  "loudnorm": true,
+  "chapters": true,
+  "incremental": true,
+  "platform": "youtube"
+ },
+ "ProRes master": {
+  "format": "prores",
+  "outputs": [
+   "native"
+  ]
+ },
+ "All social variants": {
+  "format": "h264",
+  "crf": 18,
+  "loudnorm": true,
+  "outputs": [
+   "native",
+   "1080x1920",
+   "1080x1350",
+   "1080x1080",
+   "1920x1080"
+  ]
+ },
+ "GIF preview": {
+  "format": "gif",
+  "outputs": [
+   "native"
+  ]
+ },
+ "Audio stems (WAV)": {
+  "format": "audio",
+  "acodec": "wav",
+  "outputs": [
+   "native"
+  ]
+ },
+ "Instagram Reels \u2014 Premium": {
+  "format": "h264",
+  "crf": 16,
+  "loudnorm": true,
+  "outputs": [
+   "1080x1920"
+  ],
+  "chapters": false,
+  "incremental": true,
+  "platform": "reels"
+ },
+ "TikTok \u2014 9:16": {
+  "format": "h264",
+  "bitrate": "12M",
+  "loudnorm": true,
+  "outputs": [
+   "1080x1920"
+  ],
+  "incremental": true,
+  "platform": "tiktok"
+ },
+ "YouTube Shorts": {
+  "format": "h264",
+  "crf": 17,
+  "loudnorm": true,
+  "outputs": [
+   "1080x1920"
+  ],
+  "incremental": true,
+  "platform": "shorts"
+ },
+ "LinkedIn \u2014 1:1": {
+  "format": "h264",
+  "crf": 18,
+  "loudnorm": true,
+  "outputs": [
+   "1080x1080"
+  ],
+  "incremental": true,
+  "platform": "linkedin"
+ },
+ "X / Twitter \u2014 16:9": {
+  "format": "h264",
+  "bitrate": "8M",
+  "loudnorm": true,
+  "outputs": [
+   "1920x1080"
+  ],
+  "incremental": true,
+  "platform": "x"
+ },
+ "Web \u2014 WebM VP9": {
+  "format": "webm",
+  "crf": 30,
+  "loudnorm": true
+ },
+ "Web \u2014 AV1": {
+  "format": "av1",
+  "crf": 32,
+  "loudnorm": true
+ },
+ "Master \u2014 ProRes 422 HQ": {
+  "format": "prores",
+  "prores_profile": 3,
+  "loudnorm": false
+ },
+ "Master \u2014 HEVC 10-bit-ready": {
+  "format": "hevc",
+  "crf": 20,
+  "loudnorm": false
+ },
+ "Apple \u2014 H.264 in MOV": {
+  "format": "h264",
+  "crf": 17,
+  "container": "mov",
+  "loudnorm": true
+ },
+ "Podcast \u2014 MP3": {
+  "format": "audio",
+  "acodec": "mp3",
+  "loudnorm": true
+ },
+ "GIF \u2014 social loop": {
+  "format": "gif",
+  "gif_width": 540
+ }
+}

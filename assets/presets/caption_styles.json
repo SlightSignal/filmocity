@@ -1,0 +1,87 @@
+{
+ "Clean": {
+  "size": 58,
+  "box": false,
+  "borderw": 3,
+  "y": 0.74,
+  "color": "white"
+ },
+ "Boxed": {
+  "size": 56,
+  "box": true,
+  "borderw": 0,
+  "y": 0.74,
+  "color": "white"
+ },
+ "Bold Pop": {
+  "size": 72,
+  "box": false,
+  "borderw": 6,
+  "y": 0.7,
+  "color": "#FFD166"
+ },
+ "Lower Band": {
+  "size": 50,
+  "box": true,
+  "borderw": 0,
+  "y": 0.86,
+  "color": "white"
+ },
+ "Top Safe": {
+  "size": 54,
+  "box": true,
+  "borderw": 0,
+  "y": 0.2,
+  "color": "white"
+ },
+ "Bold Pop": {
+  "size": 76,
+  "box": false,
+  "borderw": 6,
+  "y": 0.62,
+  "color": "white",
+  "animate": "pop",
+  "highlight_color": "#F6C14A"
+ },
+ "Highlight Yellow": {
+  "size": 64,
+  "box": false,
+  "borderw": 4,
+  "y": 0.7,
+  "color": "white",
+  "animate": "highlight",
+  "highlight_color": "#FFE600"
+ },
+ "Highlight Brand": {
+  "size": 64,
+  "box": false,
+  "borderw": 4,
+  "y": 0.7,
+  "color": "white",
+  "animate": "highlight",
+  "highlight_color": "{{primary}}"
+ },
+ "Boxed Black": {
+  "size": 58,
+  "box": true,
+  "borderw": 0,
+  "y": 0.74,
+  "color": "white"
+ },
+ "Minimal Grey": {
+  "size": 50,
+  "box": false,
+  "borderw": 2,
+  "y": 0.8,
+  "color": "#DDDDDD"
+ },
+ "Karaoke Green": {
+  "size": 70,
+  "box": false,
+  "borderw": 5,
+  "y": 0.66,
+  "color": "white",
+  "animate": "highlight",
+  "highlight_color": "#5BE49B"
+ }
+}

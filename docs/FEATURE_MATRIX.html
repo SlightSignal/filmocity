@@ -1,0 +1,52 @@
+<!doctype html><html><head><meta charset='utf-8'><title>Filmocity — Premiere Pro feature matrix</title><style>body{font:14px/1.5 -apple-system,Segoe UI,Inter,sans-serif;background:#1e1e1e;color:#d6d6d6;margin:0;padding:28px 40px;max-width:1200px}h1{color:#fff}table{border-collapse:collapse;width:100%}th,td{border-bottom:1px solid #333;padding:8px 10px;text-align:left;vertical-align:top}th{color:#9fc3ff}td:first-child{color:#8c8c8c;white-space:nowrap}code{background:#111;padding:0 4px;border-radius:3px}</style></head><body>
+<h1>Premiere Pro → Filmocity feature matrix</h1><p>✅ working equivalent · ◐ partial · ✗ not yet · — not applicable. Filmocity borrows Premiere's conventions, not its code or assets; Premiere Pro is a trademark of Adobe Inc.</p><table><tr><th>Area</th><th>Premiere Pro</th><th>Filmocity</th><th>Status</th></tr>
+<tr><td>Project & media</td><td>Project panel (list/icon, bins, search, columns)</td><td>Project dock: list/icon views, bins, search, Name/Frame Rate/Duration/Video/Audio columns</td><td>✅</td></tr>
+<tr><td>Project & media</td><td>Media Browser</td><td>Media Browser tab (folders, import, import-all)</td><td>✅</td></tr>
+<tr><td>Project & media</td><td>Import (video, audio, stills, image sequences)</td><td>Video/audio/stills; image sequences: import frames as stills (no auto-sequence)</td><td>◐</td></tr>
+<tr><td>Project & media</td><td>Subclips</td><td>Ctrl+U from Source In/Out</td><td>✅</td></tr>
+<tr><td>Project & media</td><td>Proxies / Ingest presets</td><td>Background proxies on import; proxy toggle in Program monitor</td><td>✅</td></tr>
+<tr><td>Project & media</td><td>Offline media / Relink / Project Manager</td><td>Offline badge + relink; Collect Files copies media and relinks</td><td>✅</td></tr>
+<tr><td>Project & media</td><td>Multiple projects / Save As</td><td>File → New / Open / Save As; per-project event logs and training data</td><td>✅</td></tr>
+<tr><td>Project & media</td><td>Team Projects / Productions</td><td>not applicable (single workstation, agent + human)</td><td>—</td></tr>
+<tr><td>Project & media</td><td>Metadata / Info panel</td><td>Info panel (sequence, clip, media) + shared Brief</td><td>◐</td></tr>
+<tr><td>Sequences</td><td>New sequence, settings, presets</td><td>Sequence Settings with social/YouTube presets; New Sequence From Clip</td><td>✅</td></tr>
+<tr><td>Sequences</td><td>Nesting</td><td>Nest selected; drag a sequence to a track; double-click to open</td><td>✅</td></tr>
+<tr><td>Sequences</td><td>Multicam source sequences / Multi-Camera view / cut-and-switch</td><td>Create from bin selection; ▦ grid; keys 1–9 cut & switch</td><td>✅ (sync by in points; audio sync analysis pending)</td></tr>
+<tr><td>Sequences</td><td>Adjustment layers</td><td>✅</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Tools: V A B N R C Y U P H Z T, shape tools</td><td>All present, including Rectangle/Ellipse and Track Select Backward</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Snapping, markers (types, durations, colors), clip markers</td><td>✅</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Insert/Overwrite, Lift/Extract, Add Edit, Ripple/Roll/Slip/Slide, Extend, Q/W</td><td>✅</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Trim mode / keyboard trims</td><td>Edit-point selection + Ctrl+←/→ (Shift ×5, Alt ripple); no dynamic JKL trim mode</td><td>◐</td></tr>
+<tr><td>Timeline</td><td>Link/unlink, group, enable/disable, labels, rename</td><td>✅ (rename via Info; labels palette)</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Sync lock, track lock, output toggle, mute/solo, source patching, targeting</td><td>✅</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Track height, expand/minimize, display options (thumbs/waveforms)</td><td>✅</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Copy/Paste, Paste Attributes, Duplicate (Alt-drag)</td><td>Copy/Paste/Paste Attributes ✅; Alt-drag duplicate ✗ (use Ctrl+C/V)</td><td>◐</td></tr>
+<tr><td>Timeline</td><td>Gap selection / Close gap</td><td>✅</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Speed/Duration, Reverse, Time Remapping, Frame Hold, Rate Stretch, Maintain Pitch, Optical Flow</td><td>✅ (optical flow via minterpolate — slow but exact)</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Scene Edit Detection</td><td>✅</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Text-based editing (transcript → cuts)</td><td>Transcribe with word timestamps; select words → delete/extract; needs faster-whisper</td><td>✅</td></tr>
+<tr><td>Timeline</td><td>Caption track (C1) with caption blocks</td><td>✅ draggable/trimmable blocks</td><td>✅</td></tr>
+<tr><td>Effects</td><td>Motion (position/scale/rotation/anchor/opacity/blend) with keyframes, bezier, value graph</td><td>✅</td><td>✅</td></tr>
+<tr><td>Effects</td><td>Masks (rect/ellipse, feather, invert, animated)</td><td>✅ (no free-form pen masks yet)</td><td>◐</td></tr>
+<tr><td>Effects</td><td>Video effects library</td><td>43 catalogued effects + built-ins (crop/blur/sharpen/vignette/chroma key) with generated controls</td><td>◐ (Premiere ships ~150; the missing ones are mostly obsolete or GPU-only)</td></tr>
+<tr><td>Effects</td><td>Keying: Ultra Key, Color Key, Luma Key, Track Matte</td><td>Ultra/Color/Luma key ✅; image matte via mask; Track Matte Key ✗</td><td>◐</td></tr>
+<tr><td>Effects</td><td>Warp Stabilizer</td><td>vidstab two-pass (Analyze in Effect Controls)</td><td>✅</td></tr>
+<tr><td>Effects</td><td>Transitions library</td><td>Dissolve, Dip B/W, 4 wipes, Iris open/close, diagonals, barn doors, clock, checker, push, slide, cross zoom; audio constant power/gain/exponential</td><td>◐ (Premiere: ~40)</td></tr>
+<tr><td>Effects</td><td>Morph Cut, Auto Reframe, Remix</td><td>✗ (ML features; Auto Reframe partially covered by per-output center crop/pad)</td><td>✗</td></tr>
+<tr><td>Color</td><td>Lumetri Basic (exposure/contrast/highlights/shadows/whites/blacks/temp/tint/saturation)</td><td>Basic correction ✅ (whites/blacks folded into highlights/shadows)</td><td>◐</td></tr>
+<tr><td>Color</td><td>Creative (LUTs, vibrance), Curves (RGB, per-channel), Color Wheels, Vignette</td><td>✅ + 8 bundled looks</td><td>✅</td></tr>
+<tr><td>Color</td><td>HSL Secondary, Hue/Sat curves</td><td>✗</td><td>✗</td></tr>
+<tr><td>Color</td><td>Scopes (waveform/parade/histogram/vectorscope)</td><td>RGB parade + histogram ✅; vectorscope ✗</td><td>◐</td></tr>
+<tr><td>Audio</td><td>Clip gain, rubber band, keyframes, pan, fades, transitions</td><td>✅</td><td>✅</td></tr>
+<tr><td>Audio</td><td>Audio Track Mixer, Audio Clip Mixer, master</td><td>Track buses with fx + master fader/limiter; clip mixer for clips under the playhead</td><td>✅</td></tr>
+<tr><td>Audio</td><td>Audio effects library</td><td>30 catalogued effects (EQ, dynamics, reverb/delay, modulation, noise reduction, stereo)</td><td>◐</td></tr>
+<tr><td>Audio</td><td>Essential Sound (auto loudness, dialogue/music presets, ducking)</td><td>Auto-match loudness, Vocal Enhancer presets, Auto-duck</td><td>✅</td></tr>
+<tr><td>Audio</td><td>VST/AU plugins</td><td>✗</td><td>✗</td></tr>
+<tr><td>Graphics</td><td>Essential Graphics: text with fonts, styles, shapes, alignment, MOGRTs</td><td>Text (system fonts, box, shadow, outline, alignment), shapes, layered templates (12 bundled + save your own)</td><td>✅ (JSON templates instead of .mogrt)</td></tr>
+<tr><td>Captions</td><td>Manual captions, styles, import/export SRT, burn-in, auto-transcribe</td><td>✅ + style presets</td><td>✅ (no 608/708)</td></tr>
+<tr><td>Export</td><td>Formats: H.264, HEVC, ProRes, GIF, PNG sequence, audio-only</td><td>✅ + hardware encoders when present</td><td>✅</td></tr>
+<tr><td>Export</td><td>Presets, multi-output (derived aspect ratios), In/Out range, loudness normalization</td><td>✅ + QA report (LUFS/true peak/spec)</td><td>✅</td></tr>
+<tr><td>Export</td><td>XML / OTIO / EDL interchange</td><td>FCP7 XML export+import, OTIO export; EDL ✗</td><td>◐</td></tr>
+<tr><td>Workspace</td><td>Menu bar, header bar, workspaces, dockable panels, keyboard shortcut editor, preferences</td><td>✅ (tabs move between docks; free-floating panels ✗)</td><td>◐</td></tr>
+<tr><td>Agent layer (Filmocity only)</td><td>Live agent edits, proposals with accept/reject, reasons, telemetry, session summary, training export</td><td>✅</td><td>✅</td></tr>
+</table></body></html>

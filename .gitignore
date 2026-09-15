@@ -1,0 +1,17 @@
+# environments and build artifacts
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+
+# fetched at install time (launcher/bootstrap.py), never committed
+bin/
+
+# runtime state
+filmocity_data/
+launcher/install.log
+launcher/installed.json
+*.log
+*.bak
+packaging/*.spec

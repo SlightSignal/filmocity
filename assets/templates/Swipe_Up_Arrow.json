@@ -1,0 +1,70 @@
+{
+ "name": "Swipe Up Arrow",
+ "premium": true,
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "polygon",
+   "points": [
+    [
+     0.5,
+     0.8
+    ],
+    [
+     0.56,
+     0.86
+    ],
+    [
+     0.52,
+     0.86
+    ],
+    [
+     0.52,
+     0.93
+    ],
+    [
+     0.48,
+     0.93
+    ],
+    [
+     0.48,
+     0.86
+    ],
+    [
+     0.44,
+     0.86
+    ]
+   ],
+   "color": "{{primary}}",
+   "shadow": true,
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5,
+    "ease": "bounce"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "LINK IN BIO",
+   "size": 40,
+   "align": "center",
+   "valign": "bottom",
+   "y": -40,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "anim_in": {
+    "type": "fade",
+    "duration": 0.3,
+    "delay": 0.3
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  }
+ ]
+}

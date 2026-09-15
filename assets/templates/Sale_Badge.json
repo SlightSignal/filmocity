@@ -1,0 +1,66 @@
+{
+ "name": "Sale Badge",
+ "premium": true,
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "ellipse",
+   "x": 0.6,
+   "y": 0.06,
+   "w": 0.34,
+   "h": 0.19,
+   "color": "{{primary}}",
+   "shadow": true,
+   "anim_in": {
+    "type": "pop",
+    "duration": 0.45,
+    "ease": "back_out"
+   },
+   "anim_out": {
+    "type": "pop",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "-30%",
+   "size": 110,
+   "align": "right",
+   "valign": "top",
+   "x": -70,
+   "y": 170,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "anim_in": {
+    "type": "fade",
+    "duration": 0.3,
+    "delay": 0.2
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  },
+  {
+   "kind": "text",
+   "text": "THIS WEEK",
+   "size": 34,
+   "align": "right",
+   "valign": "top",
+   "x": -92,
+   "y": 300,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "weight": "regular",
+   "anim_in": {
+    "type": "fade",
+    "duration": 0.3,
+    "delay": 0.35
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  }
+ ]
+}

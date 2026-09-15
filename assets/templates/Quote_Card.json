@@ -1,0 +1,65 @@
+{
+ "name": "Quote Card",
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "rect",
+   "x": 0.08,
+   "y": 0.36,
+   "w": 0.84,
+   "h": 0.28,
+   "color": "#000000",
+   "opacity": 0.6,
+   "radius": 18,
+   "anim_in": {
+    "type": "wipe_left",
+    "duration": 0.45,
+    "delay": 0.0,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "\u201cEveryone's first bowl wobbles.\u201d",
+   "size": 58,
+   "align": "center",
+   "valign": "center",
+   "y": -30,
+   "color": "white",
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5,
+    "delay": 0.22,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "\u2014 Customer, verified review",
+   "size": 34,
+   "align": "center",
+   "valign": "center",
+   "y": 70,
+   "color": "#CCCCCC",
+   "weight": "regular",
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5,
+    "delay": 0.34,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  }
+ ]
+}

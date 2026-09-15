@@ -1,0 +1,65 @@
+{
+ "name": "Social Proof",
+ "premium": true,
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "rect",
+   "x": 0.08,
+   "y": 0.36,
+   "w": 0.84,
+   "h": 0.2,
+   "radius": 30,
+   "color": "#111111",
+   "opacity": 0.85,
+   "shadow": true,
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "\u2605\u2605\u2605\u2605\u2605",
+   "size": 72,
+   "align": "center",
+   "valign": "center",
+   "y": -100,
+   "color": "{{primary}}",
+   "font": "{{font}}",
+   "anim_in": {
+    "type": "typewriter",
+    "duration": 0.7,
+    "delay": 0.2
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "12,400 riders \u00b7 4.9 average",
+   "size": 48,
+   "align": "center",
+   "valign": "center",
+   "y": -10,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "weight": "regular",
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.4,
+    "delay": 0.5
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  }
+ ]
+}

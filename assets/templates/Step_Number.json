@@ -1,0 +1,66 @@
+{
+ "name": "Step Number",
+ "premium": true,
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "ellipse",
+   "x": 0.06,
+   "y": 0.12,
+   "w": 0.16,
+   "h": 0.09,
+   "color": "{{primary}}",
+   "anim_in": {
+    "type": "pop",
+    "duration": 0.4,
+    "ease": "back_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  },
+  {
+   "kind": "text",
+   "text": "1",
+   "size": 86,
+   "align": "left",
+   "valign": "top",
+   "x": 52,
+   "y": 238,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "anim_in": {
+    "type": "fade",
+    "duration": 0.3,
+    "delay": 0.15
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  },
+  {
+   "kind": "text",
+   "text": "Charge it overnight",
+   "size": 56,
+   "align": "left",
+   "valign": "top",
+   "x": 230,
+   "y": 262,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "shadow": true,
+   "anim_in": {
+    "type": "slide_left",
+    "duration": 0.45,
+    "delay": 0.25,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  }
+ ]
+}

@@ -1,0 +1,43 @@
+{
+ "name": "Chapter Marker",
+ "layers": [
+  {
+   "kind": "box",
+   "x": 0.06,
+   "y": 0.12,
+   "w": 0.02,
+   "h": 0.06,
+   "color": "0xE8631C@1.0",
+   "anim_in": {
+    "type": "wipe_left",
+    "duration": 0.45,
+    "delay": 0.0,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "01 \u2014 Chapter title",
+   "size": 44,
+   "align": "left",
+   "valign": "top",
+   "x": 40,
+   "y": 40,
+   "color": "white",
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5,
+    "delay": 0.22,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  }
+ ]
+}

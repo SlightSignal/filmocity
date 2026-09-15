@@ -1,0 +1,69 @@
+{
+ "name": "Stat Callout",
+ "premium": true,
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "rect",
+   "x": 0.12,
+   "y": 0.36,
+   "w": 0.76,
+   "h": 0.28,
+   "radius": 40,
+   "color": "#0B0B0F",
+   "opacity": 0.78,
+   "shadow": true,
+   "anim_in": {
+    "type": "pop",
+    "duration": 0.45,
+    "ease": "back_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "450 lb",
+   "size": 190,
+   "align": "center",
+   "valign": "center",
+   "y": -40,
+   "color": "{{primary}}",
+   "font": "{{font}}",
+   "glow": true,
+   "glow_size": 22,
+   "anim_in": {
+    "type": "zoom",
+    "duration": 0.55,
+    "delay": 0.15,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "payload capacity",
+   "size": 46,
+   "align": "center",
+   "valign": "center",
+   "y": 120,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "weight": "regular",
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.4,
+    "delay": 0.4
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  }
+ ]
+}

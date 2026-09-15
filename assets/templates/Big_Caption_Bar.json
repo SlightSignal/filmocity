@@ -1,0 +1,43 @@
+{
+ "name": "Big Caption Bar",
+ "premium": true,
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "rect",
+   "x": 0.0,
+   "y": 0.62,
+   "w": 1.0,
+   "h": 0.12,
+   "color": "{{primary}}",
+   "opacity": 0.92,
+   "anim_in": {
+    "type": "wipe_left",
+    "duration": 0.4
+   },
+   "anim_out": {
+    "type": "wipe_right",
+    "duration": 0.35
+   }
+  },
+  {
+   "kind": "text",
+   "text": "THE SPEC THAT MATTERS",
+   "size": 64,
+   "align": "center",
+   "valign": "center",
+   "y": 230,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "anim_in": {
+    "type": "fade",
+    "duration": 0.3,
+    "delay": 0.25
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  }
+ ]
+}

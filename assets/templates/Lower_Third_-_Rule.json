@@ -1,0 +1,63 @@
+{
+ "name": "Lower Third \u2014 Rule",
+ "layers": [
+  {
+   "kind": "box",
+   "x": 0.06,
+   "y": 0.72,
+   "w": 0.55,
+   "h": 0.008,
+   "color": "0xE8631C@1.0",
+   "anim_in": {
+    "type": "wipe_left",
+    "duration": 0.45,
+    "delay": 0.0,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "Name Surname",
+   "size": 70,
+   "align": "left",
+   "valign": "bottom",
+   "y": -40,
+   "color": "white",
+   "shadow": true,
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5,
+    "delay": 0.22,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "Role \u00b7 @handle",
+   "size": 38,
+   "align": "left",
+   "valign": "bottom",
+   "y": 40,
+   "color": "0xDDDDDD",
+   "weight": "regular",
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5,
+    "delay": 0.34,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  }
+ ]
+}

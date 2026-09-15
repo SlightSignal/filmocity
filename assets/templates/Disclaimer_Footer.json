@@ -1,0 +1,45 @@
+{
+ "name": "Disclaimer Footer",
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "rect",
+   "x": 0.0,
+   "y": 0.93,
+   "w": 1.0,
+   "h": 0.07,
+   "color": "#000000",
+   "opacity": 0.7,
+   "anim_in": {
+    "type": "wipe_left",
+    "duration": 0.45,
+    "delay": 0.0,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "Specifications per manufacturer. Ride within local laws. Helmet on.",
+   "size": 26,
+   "align": "center",
+   "valign": "bottom",
+   "y": -16,
+   "color": "#CCCCCC",
+   "weight": "regular",
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5,
+    "delay": 0.22,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  }
+ ]
+}

@@ -1,0 +1,65 @@
+{
+ "name": "Location Tag",
+ "premium": true,
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "rect",
+   "x": 0.06,
+   "y": 0.1,
+   "w": 0.42,
+   "h": 0.06,
+   "radius": 30,
+   "color": "#000000",
+   "opacity": 0.55,
+   "anim_in": {
+    "type": "slide_left",
+    "duration": 0.4,
+    "ease": "back_out"
+   },
+   "anim_out": {
+    "type": "slide_left",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "shape",
+   "shape": "ellipse",
+   "x": 0.085,
+   "y": 0.118,
+   "w": 0.024,
+   "h": 0.024,
+   "color": "{{primary}}",
+   "anim_in": {
+    "type": "pop",
+    "duration": 0.3,
+    "delay": 0.2
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  },
+  {
+   "kind": "text",
+   "text": "Portland, OR",
+   "size": 40,
+   "align": "left",
+   "valign": "top",
+   "x": 70,
+   "y": 72,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "weight": "regular",
+   "anim_in": {
+    "type": "fade",
+    "duration": 0.3,
+    "delay": 0.25
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  }
+ ]
+}

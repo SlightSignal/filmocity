@@ -1,0 +1,47 @@
+{
+ "name": "Split Headline",
+ "premium": true,
+ "layers": [
+  {
+   "kind": "text",
+   "text": "BUILT",
+   "size": 170,
+   "align": "center",
+   "valign": "center",
+   "y": -110,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "anim_in": {
+    "type": "slide_left",
+    "duration": 0.5,
+    "distance": 0.6,
+    "ease": "back_out"
+   },
+   "anim_out": {
+    "type": "slide_left",
+    "duration": 0.4
+   }
+  },
+  {
+   "kind": "text",
+   "text": "DIFFERENT",
+   "size": 170,
+   "align": "center",
+   "valign": "center",
+   "y": 60,
+   "color": "{{primary}}",
+   "font": "{{font}}",
+   "anim_in": {
+    "type": "slide_right",
+    "duration": 0.5,
+    "distance": 0.6,
+    "delay": 0.1,
+    "ease": "back_out"
+   },
+   "anim_out": {
+    "type": "slide_right",
+    "duration": 0.4
+   }
+  }
+ ]
+}

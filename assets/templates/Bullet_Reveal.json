@@ -1,0 +1,143 @@
+{
+ "name": "Bullet Reveal",
+ "premium": true,
+ "layers": [
+  {
+   "kind": "text",
+   "text": "What you get",
+   "size": 72,
+   "align": "left",
+   "valign": "center",
+   "x": 40,
+   "y": -260,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "shadow": true,
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.45
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "shape",
+   "shape": "ellipse",
+   "x": 0.06,
+   "y": 0.475,
+   "w": 0.028,
+   "h": 0.028,
+   "color": "{{primary}}",
+   "anim_in": {
+    "type": "pop",
+    "duration": 0.3,
+    "delay": 0.35
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  },
+  {
+   "kind": "text",
+   "text": "Full suspension, both ends",
+   "size": 50,
+   "align": "left",
+   "valign": "center",
+   "x": 110,
+   "y": -95,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "weight": "regular",
+   "anim_in": {
+    "type": "slide_left",
+    "duration": 0.4,
+    "delay": 0.4
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  },
+  {
+   "kind": "shape",
+   "shape": "ellipse",
+   "x": 0.06,
+   "y": 0.535,
+   "w": 0.028,
+   "h": 0.028,
+   "color": "{{primary}}",
+   "anim_in": {
+    "type": "pop",
+    "duration": 0.3,
+    "delay": 0.75
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  },
+  {
+   "kind": "text",
+   "text": "450 lb payload",
+   "size": 50,
+   "align": "left",
+   "valign": "center",
+   "x": 110,
+   "y": 20,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "weight": "regular",
+   "anim_in": {
+    "type": "slide_left",
+    "duration": 0.4,
+    "delay": 0.8
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  },
+  {
+   "kind": "shape",
+   "shape": "ellipse",
+   "x": 0.06,
+   "y": 0.595,
+   "w": 0.028,
+   "h": 0.028,
+   "color": "{{primary}}",
+   "anim_in": {
+    "type": "pop",
+    "duration": 0.3,
+    "delay": 1.15
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  },
+  {
+   "kind": "text",
+   "text": "80-mile range",
+   "size": 50,
+   "align": "left",
+   "valign": "center",
+   "x": 110,
+   "y": 135,
+   "color": "{{text}}",
+   "font": "{{font}}",
+   "weight": "regular",
+   "anim_in": {
+    "type": "slide_left",
+    "duration": 0.4,
+    "delay": 1.2
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.2
+   }
+  }
+ ]
+}

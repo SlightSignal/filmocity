@@ -1,0 +1,45 @@
+{
+ "name": "Countdown Tag",
+ "layers": [
+  {
+   "kind": "shape",
+   "shape": "ellipse",
+   "x": 0.72,
+   "y": 0.06,
+   "w": 0.22,
+   "h": 0.12,
+   "color": "#E8631C",
+   "opacity": 0.95,
+   "anim_in": {
+    "type": "wipe_left",
+    "duration": 0.45,
+    "delay": 0.0,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "text",
+   "text": "3",
+   "size": 90,
+   "align": "right",
+   "valign": "top",
+   "x": -92,
+   "y": 40,
+   "color": "white",
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5,
+    "delay": 0.22,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  }
+ ]
+}

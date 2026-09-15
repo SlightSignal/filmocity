@@ -1,0 +1,41 @@
+{
+ "name": "Title Card \u2014 Minimal",
+ "layers": [
+  {
+   "kind": "text",
+   "text": "A quiet headline.",
+   "size": 84,
+   "align": "left",
+   "valign": "center",
+   "color": "white",
+   "anim_in": {
+    "type": "rise",
+    "duration": 0.5,
+    "delay": 0.1,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  },
+  {
+   "kind": "box",
+   "x": 0.06,
+   "y": 0.56,
+   "w": 0.12,
+   "h": 0.006,
+   "color": "white@0.9",
+   "anim_in": {
+    "type": "wipe_left",
+    "duration": 0.45,
+    "delay": 0.0,
+    "ease": "ease_out"
+   },
+   "anim_out": {
+    "type": "fade",
+    "duration": 0.3
+   }
+  }
+ ]
+}

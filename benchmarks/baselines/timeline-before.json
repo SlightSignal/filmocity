@@ -1,0 +1,7 @@
+{
+  "source": "frontend/app.js",
+  "sha256": "e59232e83512c1efaca02f2432edb77e74c6db9bf3e1950d7a9432b43ed6a0e7",
+  "purpose": "Reproduce the Node timeline-allocation and playback-scheduling baseline; not a browser timing trace.",
+  "extracted_functions": "benchmarks/baselines/timeline-before.js",
+  "extracted_sha256": "c4933b91b36e1c6782b0ff12015aa6b5f9c501a66bc5ffa19ee59d2ffe02296c"
+}

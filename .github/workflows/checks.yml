@@ -1,0 +1,57 @@
+name: Windows source checks
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6, reviewed 2026-10-05
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13.16'
+          architecture: x64
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.20.0'
+      - name: Install the reviewed Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --require-hashes -r requirements-bootstrap-windows.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install --require-hashes --no-build-isolation -r requirements-test-windows.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          exit $LASTEXITCODE
+      - name: Frontend regressions and syntax
+        run: node tests/run_frontend.cjs
+      - name: Source syntax and media-independent Windows regressions
+        shell: pwsh
+        run: |
+          python -m compileall -q backend agent launcher packaging tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $suites = @('test_http_protocol.py', 'test_request_access.py', 'test_runtime_policy.py', 'test_bootstrap_install.py', 'test_candidate_build.py', 'test_launch_identity.py', 'test_launcher_supervision.py', 'test_workspace_lock.py', 'test_project_transaction.py', 'test_project_sync.py', 'test_project_recovery.py')
+          foreach ($suite in $suites) {
+            python (Join-Path tests $suite)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+# Full FFmpeg media regressions and native WebView2 acceptance require separately
+# supplied, hash-recorded tools and the exact built artifact. This workflow does
+# not package/publish a binary or claim those checks have run.

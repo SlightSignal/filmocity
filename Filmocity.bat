@@ -1,19 +1,29 @@
 @echo off
+setlocal
 title Filmocity
 cd /d "%~dp0"
-
-rem UTF-8 MODE, added 2026-09-07. Without it Filmocity serves "Internal
-rem Server Error" on this machine and nothing else. backend/server.py:294
-rem is `open(os.path.join(FRONT,"index.html")).read()` with no encoding,
-rem so Windows decodes a UTF-8 index.html as cp1252 and dies on byte 0x8f
-rem at offset 52938. It is not one line: 66 text opens across backend/
-rem and launcher/ take the platform default, which is UTF-8 on the mac
-rem and linux this was written on and cp1252 here.
-rem
-rem PYTHONUTF8=1 is the supported switch for exactly this (PEP 540) and
-rem fixes all 66 at once without touching their code -- which also means
-rem an upstream update overwrites nothing. Python 3.15 makes it the
-rem default, so this line is temporary by design.
+rem Preserve UTF-8 text behavior for all source entry points.
 set PYTHONUTF8=1
-where py >nul 2>nul && (py -3 launcher\bootstrap.py %*) || (python launcher\bootstrap.py %*)
-if errorlevel 1 (echo. & echo Filmocity could not start. Run "Install Filmocity.bat" first, or install Python 3.10+ from python.org. & pause)
+where py >nul 2>nul
+if errorlevel 1 goto path_python
+py -3.13 packaging\runtime_policy.py
+if errorlevel 1 goto python_failed
+py -3.13 launcher\bootstrap.py %*
+goto finished
+:path_python
+python packaging\runtime_policy.py
+if errorlevel 1 goto python_failed
+python launcher\bootstrap.py %*
+:finished
+if errorlevel 1 goto launch_failed
+exit /b 0
+:python_failed
+echo.
+echo CPython 3.13.16 or newer on Python 3.13 ^(standard GIL, x64^) is required. Install it from python.org, then retry.
+pause
+exit /b 1
+:launch_failed
+echo.
+echo Filmocity could not start. See the error above and packaging\README.md.
+pause
+exit /b 1

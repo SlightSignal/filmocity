@@ -1,0 +1,18 @@
+.curve-values{color:var(--text);background:#20232b;border:1px solid #555d70;border-radius:12px;padding:24px;width:min(640px,calc(100vw - 32px));max-height:calc(100vh - 32px);overflow:auto;font-size:14px;box-shadow:0 24px 80px #0009}
+.curve-values::backdrop{background:#090b12bd}
+.curve-values h2{font-size:23px;margin:0 0 12px;color:#fff}
+.curve-values p{line-height:1.55;color:#c1c7d5;margin:12px 0}
+.curve-values label{display:flex;flex-direction:column;gap:6px;font-size:13px}
+.curve-values input[type=number],.curve-values select{width:100%;min-height:36px;padding:6px 8px;font-size:14px;user-select:text}
+.curve-values fieldset{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;border:1px solid #4a5161;border-radius:8px;margin:16px 0;padding:16px;min-width:0}
+.curve-values legend{padding:0 6px;color:#dce2ef;font-weight:600}
+.curve-values .curve-point-actions,.curve-values .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.curve-values .actions{justify-content:flex-end;border-top:1px solid #4a5161;padding-top:16px}
+.curve-values button{min-height:36px;padding:8px 14px;border-radius:6px}
+.curve-values button:disabled{opacity:.5;cursor:default}
+.curve-values .curve-message{padding:12px;background:#2c3240;border-radius:6px;color:#d8dfec;user-select:text}
+.curve-values .error{color:#ffd0d0;border:1px solid #a46767}
+.curve-values :focus-visible{outline:2px solid #b6ceff;outline-offset:3px}
+.curve-values [hidden]{display:none}
+.curve-open{margin:4px 0;min-height:28px}
+@media(max-width:440px){.curve-values fieldset{grid-template-columns:1fr}.curve-values{padding:16px}}

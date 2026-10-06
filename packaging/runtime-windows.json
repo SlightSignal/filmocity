@@ -1,0 +1,7 @@
+{
+  "schema": "filmocity-windows-runtime/v1",
+  "implementation": "CPython",
+  "minimum_version": "3.13.16",
+  "architecture": "x64",
+  "gil": "standard"
+}

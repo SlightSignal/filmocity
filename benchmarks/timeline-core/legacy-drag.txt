@@ -1,0 +1,37 @@
+function startDrag(ev, c, tr, handle, el) { if (!canEdit()) return;
+  const x0 = ev.clientX, y0 = ev.clientY, tool = S.tool; let moved = false;
+  const selIds = S.sel.has(c.id) ? [...S.sel] : [c.id]; const orig = Object.fromEntries(selIds.map(id => { const r = clipById(id); return [id, { c: deep(r.c), tr: r.tr.id }]; }));
+  const sorted = tr.clips.map(x => ({ ...x })).sort((a, b) => a.start - b.start), idx = sorted.findIndex(x => x.id === c.id), prev = idx > 0 && tr.clips.find(x => x.id === sorted[idx - 1].id), next = idx + 1 < sorted.length && tr.clips.find(x => x.id === sorted[idx + 1].id); const oPrev = prev && deep(prev), oNext = next && deep(next);
+  const mediaMax = c.media_id ? S.proj.media[c.media_id].duration : 1e9; let targetTrack = tr.id;
+  const timing = new Map([...tr.clips, ...selIds.map(id => clipById(id)?.c).filter(Boolean)].map(clip => [clip, { start: clip.start, in_: clip.in_, out: clip.out }]));
+  const reset = () => { for (const [clip, values] of timing) Object.assign(clip, values); };
+  const duplicate = S.dupPending?.clip === c ? S.dupPending : null;
+  const rollback = () => { reset(); if (duplicate) { tr.clips = tr.clips.filter(x => x !== c); S.sel = new Set(duplicate.selection); S.dupPending = null; } };
+  const move = e => { if (Math.abs(e.clientX - x0) > 2 || Math.abs(e.clientY - y0) > 6) moved = true; if (!moved) return; reset(); autoScroll(e); const dx = (e.clientX - x0) / S.pps; hideSnap(); const o = orig[c.id].c; const sp = o.speed || 1;
+    if (handle || tool === "ripple" || tool === "roll" || tool === "slip" || tool === "slide" || tool === "ratestretch") { const fr = Math.round(dx / frame()); trimReadout(`${fr >= 0 ? "+" : ""}${fr} f  ${tool === "slip" ? "slip" : tool === "slide" ? "slide" : tool === "roll" ? "roll" : tool === "ripple" ? "ripple" : "trim"}`, e.clientX, e.clientY); S.previewT = handle === "l" || tool === "slip" ? c.start : clipEnd(c); if (tool === "slip") S.slipTwoUp = c; } else if (moved && e.ctrlKey && selIds.length === 1) trimReadout("insert", e.clientX, e.clientY); else trimReadout(null);
+    if (tool === "slip" || (tool === "select" && e.altKey && !handle && !duplicate)) { let d = dx * sp; d = Math.max(-o.in_, Math.min(mediaMax - o.out, d)); c.in_ = o.in_ + d; c.out = o.out + d; }
+    else if (tool === "slide" && !handle) { let ns = Math.max(oPrev ? oPrev.start + frame() : 0, o.start + dx); if (oNext) ns = Math.min(ns, clipEnd(oNext) - clipDur(o) - frame()); const d = ns - o.start; c.start = ns;
+      if (prev) prev.out = oPrev.out + d * (oPrev.speed || 1); if (next) { next.start = oNext.start + d; next.in_ = oNext.in_ + d * (oNext.speed || 1); } }
+    else if (handle && (tool === "ripple" || tool === "select" || tool === "roll")) {
+      if (handle === "l") { let ns = snapT(Math.max(0, o.start + dx), c.id); if (tool === "roll" && prev) { ns = Math.max(ns, prev.start + frame()); } const d = ns - o.start; const nin = o.in_ + d * sp;
+        if (nin >= 0 && nin < o.out - frame()) { c.start = ns; c.in_ = nin; if (tool === "ripple") { rippleFrom(tr, c, o, o.start - ns); c.start = o.start; }
+          if (tool === "roll" && prev) prev.out = oPrev.out + d * (oPrev.speed || 1); if (ns !== o.start + dx) showSnap(ns); } }
+      else { let ne = snapT(Math.max(o.start + frame(), clipEnd(o) + dx), c.id); if (tool === "roll" && next) ne = Math.min(ne, clipEnd(oNext) - frame()); const nout = o.in_ + (ne - o.start) * sp;
+        if (nout <= mediaMax && nout > c.in_ + frame() / 2) { const d = ne - clipEnd(o); c.out = nout; if (tool === "ripple") rippleFrom(tr, c, o, d); if (tool === "roll" && next) { next.start = oNext.start + d; next.in_ = oNext.in_ + d * (oNext.speed || 1); } if (ne !== clipEnd(o) + dx) showSnap(ne); } }
+    }
+    else if (!handle) { // group move (+ cross-track for a single clip)
+      let base = Math.max(0, o.start + dx), snapped = snapT(base, S.sel); if (snapped !== base) showSnap(snapped); const d = snapped - o.start;
+      for (const id of selIds) { const r = clipById(id); if (r && !r.tr.locked) r.c.start = Math.max(0, orig[id].c.start + d); }
+      if (selIds.length === 1) { const row = document.elementsFromPoint(e.clientX, e.clientY).find(x => x.classList && x.classList.contains("track")); if (row && row.dataset.track !== targetTrack) { const nt = trackOf(row.dataset.track); if (nt && nt.kind === tr.kind && !nt.locked && (nt.kind === "video" || !c.title)) targetTrack = nt.id; } }
+    }
+    renderTimeline(); refreshSel(); if (handle || ["ripple", "roll", "slip", "slide", "ratestretch"].includes(tool)) { S.previewT = handle === "l" || tool === "slip" ? c.start : clipEnd(c); renderProgram(); } };
+  const up = e => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); hideSnap(); trimReadout(null); S.previewT = null; S.slipTwoUp = null; if (!moved) { rollback(); renderTimeline(); renderProgram(); return; }
+    if (e && e.ctrlKey && !handle && tool === "select" && !duplicate && selIds.length === 1) { const t2 = trackOf(targetTrack) || tr; const d = clipDur(c); const ops2 = []; for (const x of t2.clips) if (x.id !== c.id && !S.sel.has(x.id) && x.start >= c.start - 1e-6) ops2.push({ op: "set_clip", sequence: S.seq.id, track: t2.id, clip: { id: x.id, start: x.start + d } }); if (targetTrack !== tr.id) { ops2.push({ op: "remove_clip", sequence: S.seq.id, track: tr.id, clip_id: c.id }); ops2.push({ op: "set_clip", sequence: S.seq.id, track: targetTrack, clip: deep(c) }); } else ops2.push({ op: "set_clip", sequence: S.seq.id, track: tr.id, clip: { id: c.id, start: c.start } }); const si = S.proj.sequences.indexOf(S.seq); const markers = (S.seq.markers || []).map(m => m.time >= c.start - 1e-6 ? { ...m, time: Math.max(0, m.time + d) } : m); if (markers.length) ops2.push({ op: "set", path: `/sequences/${si}/markers`, value: markers }); applyOps(ops2, "insert_drag", "Ctrl-drag insert"); return; }
+    const ops = []; const push = (trackId, clip) => ops.push({ op: "set_clip", sequence: S.seq.id, track: trackId, clip });
+    if (S.dupPending && S.dupPending.clip.id === c.id) { S.dupPending = null; push(targetTrack !== tr.id ? targetTrack : tr.id, deep(c)); if (targetTrack !== tr.id) tr.clips = tr.clips.filter(x => x.id !== c.id); applyOps(ops, "duplicate", "Alt-drag duplicate"); return; }
+    if (targetTrack !== tr.id) { ops.push({ op: "remove_clip", sequence: S.seq.id, track: tr.id, clip_id: c.id }); push(targetTrack, deep(c)); }
+    else for (const id of selIds) { const r = clipById(id); push(r.tr.id, { id, start: r.c.start, in_: r.c.in_, out: r.c.out }); }
+    if (tool === "ripple" || tool === "roll" || tool === "slide") for (const x of tr.clips) if (!selIds.includes(x.id)) { const ox = timing.get(x); if (ox && (ox.start !== x.start || ox.in_ !== x.in_ || ox.out !== x.out)) push(tr.id, { id: x.id, start: x.start, in_: x.in_, out: x.out }); }
+    applyOps(ops, tool + (handle ? "_trim_" + handle : ""), `${tool}${handle ? " trim " + (handle === "l" ? "head" : "tail") : selIds.length > 1 ? " move " + selIds.length + " clips" : targetTrack !== tr.id ? " move to " + targetTrack : " move"}`); };
+  watchEditGesture(ev, move, up, rollback);
+}

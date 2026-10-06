@@ -1,0 +1,5 @@
+-r requirements.txt
+# Build recipe minimums; installed exact versions are recorded in build.json.
+# Native acceptance is required for the resulting dependency combination.
+pyinstaller>=6
+pywebview>=5

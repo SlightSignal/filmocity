@@ -1,0 +1,2 @@
+function snapT(t, exclude) { if (!S.snap) return t; const pts = [0, S.t]; for (const tr of S.seq.tracks) for (const c of tr.clips) { if (exclude && exclude.has ? exclude.has(c.id) : c.id === exclude) continue; pts.push(c.start, clipEnd(c)); } for (const m of S.seq.markers || []) pts.push(m.time); if (S.seq.in_point != null) pts.push(S.seq.in_point); if (S.seq.out_point != null) pts.push(S.seq.out_point);
+  let best = t, bd = 8 / S.pps; for (const p of pts) if (Math.abs(p - t) < bd) { bd = Math.abs(p - t); best = p; } return best; }

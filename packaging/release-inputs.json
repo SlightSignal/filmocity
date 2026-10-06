@@ -1,0 +1,17 @@
+{
+  "schema": "filmocity-release-inputs/v1",
+  "benchmarks": [
+    "benchmarks/README.md",
+    "benchmarks/baselines/chunk-sequence-before.py",
+    "benchmarks/baselines/editing-workflow-before.py",
+    "benchmarks/baselines/timeline-before.js",
+    "benchmarks/baselines/timeline-before.json",
+    "benchmarks/source-replacement-sync/reviews/m1k-audio-audit/media/quiet_then_loud.wav",
+    "benchmarks/source-replacement-sync/reviews/m1k-audio-audit/media/silence.wav",
+    "benchmarks/story-editing/measure.py",
+    "benchmarks/timeline-core/legacy-drag.txt",
+    "benchmarks/timeline-core/legacy-snap.txt",
+    "benchmarks/timeline-harness.cjs",
+    "benchmarks/timeline.cjs"
+  ]
+}

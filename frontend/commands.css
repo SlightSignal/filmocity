@@ -1,0 +1,51 @@
+/* Command search, shortcut editing, and the first-edit entry point. */
+.command-launcher{display:flex;align-items:center;gap:9px;white-space:nowrap;padding:5px 10px;min-height:29px;border:1px solid #4b5265;border-radius:6px;background:#252936;color:#e5eaff}
+.command-launcher svg{width:15px;height:15px;flex:none}
+.command-launcher kbd{font:10px var(--mono);color:#bbc5dd;letter-spacing:0}
+.command-dialog,.shortcut-dialog{box-sizing:border-box;color:#e6e9f2;background:#1c1f28;border:1px solid #485168;border-radius:14px;padding:0;width:min(760px,calc(100vw - 32px));max-height:calc(100vh - 48px);box-shadow:0 28px 100px #0009;overflow:auto}
+.command-dialog::backdrop,.shortcut-dialog::backdrop{background:#090b12c9;backdrop-filter:blur(4px)}
+.command-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:22px 24px 12px}
+.command-heading h2{font-size:20px;line-height:1.4;margin:0;color:#f5f7ff;letter-spacing:-.02em}
+.command-heading p{font-size:12px;color:#b6c0d5;margin:4px 0 0;line-height:1.5}
+.command-heading button{border:1px solid #505971;background:transparent;color:#d9e0f1;min-height:34px;padding:6px 12px;border-radius:6px}
+.command-search-wrap{padding:4px 24px 16px}
+.command-search-wrap label{display:block;color:#bac5dd;font-size:12px;margin-bottom:7px}
+.command-search-wrap input{box-sizing:border-box;width:100%;padding:13px 14px;font-size:16px;line-height:1.4;border:1px solid #687795;border-radius:8px;background:#131822;color:#f5f7ff}
+.command-search-wrap input::placeholder{color:#a6b3cf}
+.command-results{max-height:min(52vh,480px);overflow-y:auto;border-block:1px solid #353e52;padding:6px 12px;scroll-padding:8px}
+.command-result{display:flex;align-items:center;gap:8px;padding:11px 12px;border:1px solid transparent;border-radius:8px;cursor:pointer;min-height:47px}
+.command-result:hover{background:#282f3f}
+.command-result[aria-selected=true]{border-color:#91aaff;background:#2d3c5e}
+.command-result[aria-disabled=true]{cursor:default}
+.command-result[aria-disabled=true] .command-copy strong{color:#aab6ce}
+.command-copy{flex:1;min-width:0}
+.command-copy strong{display:block;font-size:13px;line-height:1.5;font-weight:600;overflow-wrap:anywhere}
+.command-copy>span{display:block;font-size:11px;line-height:1.6;color:#bbc6dc;overflow-wrap:anywhere}
+.command-result kbd,.shortcut-binding{font:11px var(--mono);color:#d1defa;padding:5px 8px;border:1px solid #667493;border-radius:5px;background:#202839;white-space:nowrap}
+.command-message{margin:0;padding:14px 24px;font-size:12px;color:#c3cee5;line-height:1.6;min-height:20px}
+.command-dialog :focus-visible,.shortcut-dialog :focus-visible,.project-welcome :focus-visible,.command-launcher:focus-visible{outline:2px solid #adc1ff;outline-offset:3px}
+.shortcut-dialog{width:min(830px,calc(100vw - 32px))}
+.shortcut-list{max-height:48vh;overflow:auto;border-block:1px solid #353e52;padding:4px 20px;scroll-padding:10px}
+.shortcut-row{display:grid;grid-template-columns:minmax(150px,1fr) minmax(140px,190px) 60px;align-items:center;gap:12px;padding:9px 4px;border-bottom:1px solid #323b4e;font-size:12px;line-height:1.5}
+.shortcut-row:last-child{border-bottom:0}
+.shortcut-row>span{overflow-wrap:anywhere}
+.shortcut-row button{min-height:34px;white-space:normal}
+.shortcut-message{padding:0 24px 12px;color:#c3cee5;font-size:12px;line-height:1.6;margin:0;min-height:19px}
+.shortcut-message.error{color:#ffbbbb}
+.shortcut-empty{padding:20px 4px;color:#c3cee5}
+.shortcut-footer{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:15px 24px}
+.shortcut-footer p{margin:0;font-size:11px;color:#b5c3de;line-height:1.5}
+.shortcut-footer button{min-height:35px;white-space:nowrap}
+.shortcut-dialog button:disabled{opacity:.55;cursor:default}
+.project-welcome{margin:12px 6px 18px;padding:24px;border:1px solid #44516d;border-radius:12px;background:linear-gradient(135deg,#253148,#1c222f);text-align:left;min-width:0}
+.project-welcome .eyebrow{font-size:10px;font-weight:700;letter-spacing:.12em;color:#b6c7f0;margin:0 0 10px}
+.project-welcome h3{color:#f3f6ff;font-size:21px;line-height:1.3;letter-spacing:-.02em;margin:0 0 9px}
+.project-welcome p{font-size:12px;line-height:1.65;color:#c1cde3;margin:0 0 18px;max-width:48ch}
+.welcome-actions{display:flex;flex-wrap:wrap;gap:8px}
+.welcome-actions button{font-size:12px;padding:9px 12px;min-height:36px;border-radius:6px;border:1px solid #697c9e;background:#202b3e;color:#e6edff}
+.welcome-actions button.primary{background:#b3c6ff;color:#121e39;border-color:#b3c6ff;font-weight:700}
+.welcome-actions button:hover{background:#364967;color:#fff}
+.welcome-actions button.primary:hover{background:#c6d4ff;color:#121e39}
+@media(max-width:1200px){.command-launcher kbd{display:none}.command-launcher{gap:6px}}
+@media(max-width:550px){.command-heading{padding:16px}.command-search-wrap{padding:0 16px 12px}.command-message{padding:12px 16px}.command-results{padding:4px}.command-result{gap:5px}.command-result kbd{font-size:9px;padding:4px}.shortcut-row{grid-template-columns:minmax(0,1fr) minmax(90px,130px) 50px;gap:8px}.shortcut-list{padding:4px 12px}.project-welcome{padding:18px}.shortcut-footer{flex-wrap:wrap}}
+@media(forced-colors:active){.command-result[aria-selected=true]{outline:2px solid Highlight}.command-result[aria-disabled=true]{color:GrayText}.command-copy>span{color:CanvasText}}

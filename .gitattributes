@@ -1,0 +1,11 @@
+* text=auto eol=lf
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.wav -text
+*.ttf -text
+*.otf -text
+# Preserve the original upstream notice bytes bound by the dependency inventory.
+licenses/** -text -whitespace

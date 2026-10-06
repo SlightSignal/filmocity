@@ -1,3 +1,5 @@
+Current release scope and open gates are in [release readiness](RELEASE_READINESS.md). The dated inventory below is historical; its fixed/parity labels, unexecuted-launch statements and encoder claims are not current acceptance results. [Reliability](RELIABILITY.md) retains implementation history.
+
 # What Filmocity is still missing — an honest inventory (v0.41)
 
 Feature parity with Premiere is now broad (`docs/AUDIT.md`). This document is the other list: everything that is thin, untested, structurally weak or absent, across product, engineering, data and process. Severity: **S1** would embarrass us on a real job · **S2** a real editor would hit it in a week · **S3** matters at scale or later. Effort: S/M/L. Items marked **fixed in v0.20** were closed while writing this.
@@ -9,7 +11,7 @@ Feature parity with Premiere is now broad (`docs/AUDIT.md`). This document is th
 | **Real camera footage** | S1 | M | **largely fixed in v0.23** — `tests/test_footage.py` covers rotation, 10-bit HEVC, HLG HDR, ProRes, VFR, portrait 4K, 59.94p, GIF, alpha PNG, 5.1 and 44.1k mono end to end (import → cut → export → frame checks). Still unverified: real camera files from actual devices (Sony/Canon/iPhone containers, log curves). |
 | **Hardware encoders** (NVENC/QSV/AMF/VideoToolbox) | S2 | S | Detected but never used; AMF not probed at all. |
 | **Long projects** (hours of media, hundreds of files, 30+ minute sequences) | S2 | M | Thumbnails/filmstrips/proxies are generated per import synchronously; an hour of 4K would block. Needs a background ingest queue with status. |
-| **Non-ASCII and space-laden paths** on Windows | S2 | S | Escaping exists; untested with real filenames like `C:\Users\Émilie\My Footage\`. |
+| **Non-ASCII and space-laden paths** on Windows | S2 | S | Escaping exists; untested with real filenames like `%USERPROFILE%\Movies\Example footage\`. |
 
 ## 2. Structural / engineering
 | Gap | Sev | Effort | Notes |
@@ -35,7 +37,7 @@ Feature parity with Premiere is now broad (`docs/AUDIT.md`). This document is th
 | Per-track keyframes (track volume envelopes) | S3 | M | Buses have static gain only. |
 | Nested sequence editing "in place" with parent context | S3 | M | You open the nest as a tab; no parent-relative timing display. |
 | Mixed frame rates: conform only, no rate-aware trims | S3 | M | 23.976/29.97 timecode display is integer-fps only (drop-frame TC not shown). |
-| Colour management: Rec.709 assumed | S2 | L | **fixed in v0.28** — HDR tonemap (v0.21) + camera log input transforms for S-Log3, V-Log, C-Log3, LogC3 (generated from the published curves). Remaining: ACES-style scene-referred pipeline. |
+| Colour management | S2 | L | **In progress, M6** — tagged BT.2020 SDR and PQ/HLG input conversion, explicit peak, required filters and guarded source intent now have synthetic evidence. Camera LUTs override automatic conversion. Explicit Rec.709 delivery matrix/range/tags now have synthetic encoded-output evidence (M6b). Encoded 8-bit compositing, ordinary SDR interpretation, full working/display/output policy, native delivery/ICC, real camera log/HLG and high-bit-depth qualification remain open. See PROFESSIONAL-ROADMAP.md. |
 | Multicam: no audio-follows-video mixing beyond one source; no angle thumbnails in the bin | S3 | S | |
 | Time Tuner changes speed uniformly; Premiere also removes frames at cuts | S3 | M | |
 

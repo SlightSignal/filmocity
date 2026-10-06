@@ -6,30 +6,51 @@ Then open http://localhost:8787  (the agent uses the same URL; see docs/AGENT_AP
 """
 import os, sys, json, time, uuid, shutil, subprocess, threading, argparse, copy, mimetypes
 from typing import Any, Optional
-import asyncio, hashlib
+import asyncio, hashlib, math
+import subprocesses as subprocess
 from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 sys.path.insert(0, os.path.dirname(__file__))
-from render import render as do_render, build_command, render_frame, render_incremental, segment_boundaries, chunk_sequence, chunk_key
+from render import render as do_render, build_command, render_frame, render_incremental, segment_boundaries, chunk_sequence, index_sequence, chunk_key, png_sequence_directory, seq_total
+from render_context import RenderContext
+from preview_binding import preview_binding, PREVIEW_PRESET
 from interchange import to_fcp7_xml, to_otio, captions_to_srt, srt_to_captions, from_fcp7_xml, to_edl, captions_to_vtt
 from effects import catalog as effects_catalog
 import advisor as _advisor
+from preflight import inspect_resources, require_resources, ResourceError, media_online
+from media_collection import MediaCollection, MediaCollectionError
+from project_sync import project_context, matches_context, workspace_id
+from runtime_identity import read_build_info, REQUEST_SHUTDOWN_GRACE
+from workspace_lock import hold_workspace
+from background_tasks import TaskManager, TaskError
+import task_inputs
+import media_preparation
+from project_versions import read_version, list_versions, write_snapshot
+from project_transaction import commit_pair, recover_transaction, TransactionRecoveryRequired
+from project_history import changes_between, apply_changes, HistoryConflict
+from proposal_preview import PreviewStore, PreviewUnavailable
+from project_recovery import (ProjectRecoveryRequired, RecoveryError, RecoveryConflict,
+                              parse_project, has_recovery_files, inspect_recovery, restore_version, preserve_editor_draft)
 
 HERE = os.path.dirname(os.path.abspath(__file__)); FRONT = os.path.join(os.path.dirname(HERE), "frontend"); ASSETS = os.path.join(os.path.dirname(HERE), "assets"); DOCS = os.path.join(os.path.dirname(HERE), "docs")
 ROOT = os.environ.get("FILMOCITY_ROOT", os.path.expanduser("~/filmocity_data"))
 def P(*a): return os.path.join(ROOT, *a)
 
-VERSION = "0.20"
+VERSION = "0.47.0-rc.1"
+INSTANCE_ID = os.environ.get("FILMOCITY_LAUNCH_ID") or uuid.uuid4().hex
+BUILD_INFO = read_build_info(os.path.dirname(HERE))
 app = FastAPI(title="Filmocity", version=VERSION, docs_url="/api/docs", openapi_url="/api/openapi.json", redoc_url=None)
+TASKS = None
 LOCK = threading.Lock(); CLIENTS: list[WebSocket] = []; JOBS: dict[str, dict] = {}; OPS_SINCE_AUTOSAVE = 0
 
 # ---------- project store ----------
 def active_id():
     p = P("active.json")
     if os.path.exists(p):
-        try: return json.load(open(p)).get("id") or "default"
+        try:
+            with open(p, encoding="utf-8") as stream: return json.load(stream).get("id") or "default"
         except Exception: pass
     return "default"
 
@@ -55,9 +76,15 @@ def default_project():
 
 def load_project():
     p = PP("project.json")
+    recover_transaction(p)
     if not os.path.exists(p):
+        if has_recovery_files(p):
+            raise ProjectRecoveryRequired("Project file is missing; saved recovery versions may be available.")
         save_project(default_project())
-    proj = json.load(open(p))
+    try:
+        with open(p, "rb") as stream: proj = parse_project(stream.read())
+    except RecoveryError as error:
+        raise ProjectRecoveryRequired(str(error)) from error
     if proj.get("version", 1) < SCHEMA: proj = migrate_project(proj); save_project(proj)
     return proj
 
@@ -70,31 +97,53 @@ def migrate_project(proj):
         for sq in proj.get("sequences", []): sq.setdefault("guides", {"h": [], "v": []}); sq.setdefault("master", {}); sq.setdefault("captions", [])
     proj["version"] = SCHEMA; return proj
 
-def save_project(proj):
-    proj["updated"] = time.time(); proj.setdefault("version", SCHEMA)
-    tmp = PP("project.json.tmp"); json.dump(proj, open(tmp, "w"), indent=1)
-    cur = PP("project.json")
+def save_project(proj, project_file=None, *, updated=None, protected_backup=None):
+    proj["updated"] = time.time() if updated is None else updated; proj.setdefault("version", SCHEMA)
+    cur = project_file or PP("project.json"); tmp = cur + ".tmp"
+    # Serialize first so an invalid edit cannot truncate a recoverable temp file.
+    payload = json.dumps(proj, indent=1, allow_nan=False)
+    with open(tmp, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write(payload); stream.flush(); os.fsync(stream.fileno())
     if os.path.exists(cur):  # rolling backups: one per minute at most, keep the last 30
-        bdir = PP("backups"); os.makedirs(bdir, exist_ok=True); last = sorted(os.listdir(bdir))[-1:] if os.listdir(bdir) else []
+        import re
+        bdir = os.path.join(os.path.dirname(cur), "backups"); os.makedirs(bdir, exist_ok=True)
+        backups = sorted((f for f in os.listdir(bdir) if re.fullmatch(r"project_\d+\.json", f)), key=lambda f: int(f[8:-5])); last = backups[-1:]
         if not last or time.time() - float(last[0].split("_")[1].split(".")[0]) > 60:
             shutil.copy2(cur, os.path.join(bdir, f"project_{int(time.time())}.json"))
-            for old in sorted(os.listdir(bdir))[:-30]: os.remove(os.path.join(bdir, old))
-    os.replace(tmp, cur)
+            backups = sorted((f for f in os.listdir(bdir) if re.fullmatch(r"project_\d+\.json", f)), key=lambda f: int(f[8:-5]))
+            for old in backups[:-30]:
+                if old != protected_backup: os.remove(os.path.join(bdir, old))
+    # Windows readers/virus scanners can briefly open the destination without
+    # delete sharing. Keep the previous project intact and retry only that
+    # bounded permission/sharing condition; other failures remain immediate.
+    for attempt in range(6):
+        try:
+            os.replace(tmp, cur)
+            break
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (5, 32, 33) or attempt == 5:
+                raise
+            time.sleep(min(0.02 * (2 ** attempt), 0.2))
 
-def log_event(ev):
-    ev.setdefault("ts", time.time()); ev.setdefault("id", str(uuid.uuid4())[:8]); ev.setdefault("project", active_id())
-    with open(PP("events.jsonl"), "a") as f: f.write(json.dumps(ev) + "\n")
+def log_event(ev, project_id=None):
+    ev.setdefault("ts", time.time()); ev.setdefault("id", str(uuid.uuid4())[:8]); ev.setdefault("project", project_id if project_id is not None else active_id())
+    event_file = P("projects", project_id, "events.jsonl") if project_id is not None else PP("events.jsonl")
+    with open(event_file, "a", encoding="utf-8") as f: f.write(json.dumps(ev) + "\n")
     return ev
 
 TOKEN = {"value": os.environ.get("FILMOCITY_TOKEN") or None}
+from request_access import access_error, same_token
 @app.middleware("http")
 async def _auth(request: Request, call_next):
     tok = TOKEN["value"]
-    if tok and (request.url.path.startswith("/api/") or request.url.path in ("/", "/ws")):
-        given = request.headers.get("authorization", "").replace("Bearer ", "") or request.query_params.get("token") or request.cookies.get("filmocity_token")
-        if given != tok and request.url.path != "/api/version": return JSONResponse({"error": "access token required (append ?token=… to the URL once)"}, status_code=401)
+    denied = access_error(request, tok)
+    if denied: return JSONResponse({"error": denied[1]}, status_code=denied[0])
     resp = await call_next(request)
-    if tok and request.query_params.get("token") == tok: resp.set_cookie("filmocity_token", tok, httponly=True, samesite="lax")
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    if tok and same_token(request.query_params.get("token"), tok):
+        resp.set_cookie("filmocity_token", tok, httponly=True, samesite="strict", secure=request.url.scheme == "https")
+    if tok: resp.headers["Cache-Control"] = "private, no-store"
     return resp
 
 MAIN_LOOP = {"loop": None}
@@ -113,16 +162,22 @@ async def broadcast(ev):
 
 # ---------- json pointer ops ----------
 def _walk(obj, path):
-    parts = [p for p in path.strip("/").split("/") if p != ""]
+    parts = [p.replace("~1", "/").replace("~0", "~") for p in path.strip("/").split("/") if p != ""]
     for p in parts[:-1]:
         obj = obj[int(p)] if isinstance(obj, list) else obj[p]
     return obj, (parts[-1] if parts else None)
 
 def validate_ops(proj, ops):
     """Reject malformed ops before they touch the project: unknown op, missing sequence/track, negative or inverted ranges, unknown media."""
+    if not isinstance(ops, list) or any(not isinstance(op, dict) for op in ops): return ["Operations must be a list of objects"]
     seqs = {sq["id"]: sq for sq in proj["sequences"]}; problems = []
     for i, o in enumerate(ops):
         k = o.get("op")
+        if k == "set_mix":
+            import mixer_edit
+            try: mixer_edit.validate(proj, o)
+            except (ValueError, TypeError, KeyError) as error: problems.append(f"op[{i}]: {error}")
+            continue
         if k not in ("set_clip", "remove_clip", "set", "insert", "remove", "replace"): problems.append(f"op[{i}]: unknown op '{k}'"); continue
         if k in ("set_clip", "remove_clip"):
             sq = seqs.get(o.get("sequence"))
@@ -140,7 +195,15 @@ def validate_ops(proj, ops):
                 if "in_" in merged and "out" in merged and isinstance(merged.get("in_"), (int, float)) and isinstance(merged.get("out"), (int, float)) and merged["out"] <= merged["in_"] + 1e-9: problems.append(f"op[{i}]: out ({merged['out']}) must be after in ({merged['in_']})")
                 if merged.get("speed") is not None and not (0.01 <= float(merged["speed"]) <= 100): problems.append(f"op[{i}]: speed out of range")
                 m = proj["media"].get(merged.get("media_id")) if merged.get("media_id") else None
-                if m and not m.get("is_image") and isinstance(merged.get("out"), (int, float)) and merged["out"] > float(m.get("duration", 1e9)) + 0.05: problems.append(f"op[{i}]: out ({merged['out']}) exceeds media duration ({m.get('duration')})")
+                if m and not m.get("is_image"):
+                    # A held clip stores its timeline length in out-in; only in_
+                    # selects a source frame. Its duration may exceed the source.
+                    if merged.get("hold"):
+                        held = merged.get("in_")
+                        if isinstance(held, (int, float)) and held >= float(m.get("duration", 1e9)):
+                            problems.append(f"op[{i}]: held frame ({held}) must be before media end ({m.get('duration')})")
+                    elif isinstance(merged.get("out"), (int, float)) and merged["out"] > float(m.get("duration", 1e9)) + 0.05:
+                        problems.append(f"op[{i}]: out ({merged['out']}) exceeds media duration ({m.get('duration')})")
     return problems
 
 def inverse_ops(ops, befores, proj_after):
@@ -148,6 +211,9 @@ def inverse_ops(ops, befores, proj_after):
     inv = []
     for o, b in reversed(list(zip(ops, befores))):
         k = o.get("op")
+        if k == "set_mix":
+            import mixer_edit
+            inv.extend(mixer_edit.inverse(proj_after, o, b)); continue
         if k == "set_clip": inv.append({"op": "set_clip", "sequence": o["sequence"], "track": o["track"], "clip": b} if b else {"op": "remove_clip", "sequence": o["sequence"], "track": o["track"], "clip_id": o["clip"]["id"]})
         elif k == "remove_clip":
             if b: inv.append({"op": "set_clip", "sequence": o["sequence"], "track": o["track"], "clip": b})
@@ -158,46 +224,74 @@ def inverse_ops(ops, befores, proj_after):
     return inv
 
 def undo_stack_path(): return PP("undo_stack.json")
-def undo_push(entry):
-    st = json.load(open(undo_stack_path())) if os.path.exists(undo_stack_path()) else {"undo": [], "redo": []}
-    st["undo"].append(entry); st["undo"] = st["undo"][-200:]; st["redo"] = []; json.dump(st, open(undo_stack_path(), "w"))
+def read_undo_history(pid):
+    path = P("projects", pid, "undo_stack.json")
+    if not os.path.exists(path): return {"undo": [], "redo": []}
+    try:
+        with open(path, encoding="utf-8") as stream: history = json.load(stream)
+        if not isinstance(history, dict) or any(not isinstance(history.get(key), list) or any(not isinstance(item, dict) for item in history[key]) for key in ("undo", "redo")):
+            raise ValueError("Invalid undo/redo records")
+        return history
+    except (ValueError, TypeError, UnicodeError) as error:
+        raise TransactionRecoveryRequired("Undo history is unreadable. Open Recovery to preserve it and choose a project version.") from error
+
+
+def commit_project_history(proj, history, pid, *, protected_backup=None):
+    proj["updated"] = time.time(); proj.setdefault("version", SCHEMA)
+    project_raw = json.dumps(proj, indent=1, allow_nan=False).encode("utf-8")
+    parse_project(project_raw)
+    history_raw = json.dumps(history, allow_nan=False).encode("utf-8")
+    path = P("projects", pid, "project.json")
+    options = {"protected_backup": protected_backup} if protected_backup else {}
+    return commit_pair(path, project_raw, history_raw, lambda: save_project(proj, path, updated=proj["updated"], **options))
+
+
+def commit_edit(before, after, pid, entry=None, *, protected_backup=None):
+    if after.get("version", 1) < SCHEMA: migrate_project(after)
+    history = read_undo_history(pid)
+    changes = changes_between(before, after)
+    if entry and entry.get("tool") in ("workflow_relink", "workflow_interpret", "collect"):
+        from editing_workflow import relink_history_changes
+        changes = relink_history_changes(before, after, changes)
+    if changes:
+        history["redo"] = []
+        if entry is not None:
+            history["undo"] = (history["undo"] + [{**entry, "changes": changes}])[-200:]
+    return commit_project_history(after, history, pid, protected_backup=protected_backup)
+
 
 def normalize_tracks(proj):
-    """Premiere semantics: one clip per instant per track. Later-placed (list order) clips win; earlier clips are trimmed or split around them. Returns human-readable warnings."""
-    warnings = []
-    for sq in proj["sequences"]:
-        for tr in sq["tracks"]:
-            clips = tr["clips"]; changed = True; guard = 0
-            while changed and guard < 20:
-                changed = False; guard += 1
-                for i in range(len(clips)):
-                    for j in range(len(clips)):
-                        if i == j: continue
-                        a, b = clips[i], clips[j]
-                        if i > j: continue  # b is later in list order → b wins over a
-                        ad = (a["out"] - a["in_"]) / max(a.get("speed", 1), 1e-6); bd = (b["out"] - b["in_"]) / max(b.get("speed", 1), 1e-6)
-                        a0, a1, b0, b1 = a["start"], a["start"] + ad, b["start"], b["start"] + bd
-                        if b0 >= a1 - 1e-6 or b1 <= a0 + 1e-6: continue
-                        sp = a.get("speed", 1)
-                        if b0 <= a0 + 1e-6 and b1 >= a1 - 1e-6: clips.remove(a); warnings.append(f"{sq['id']}/{tr['id']}: clip {a['id']} fully covered by {b['id']} — removed"); changed = True; break
-                        elif b0 <= a0 + 1e-6: a["in_"] += (b1 - a0) * sp; a["start"] = b1; warnings.append(f"{sq['id']}/{tr['id']}: clip {a['id']} head trimmed to {b['id']}"); changed = True; break
-                        elif b1 >= a1 - 1e-6: a["out"] -= (a1 - b0) * sp; warnings.append(f"{sq['id']}/{tr['id']}: clip {a['id']} tail trimmed to {b['id']}"); changed = True; break
-                        else:
-                            right = copy.deepcopy(a); right["id"] = a["id"] + "_r"; right["start"] = b1; right["in_"] = a["in_"] + (b1 - a0) * sp; right["transition_in"] = None; a["out"] = a["in_"] + (b0 - a0) * sp; a["transition_out"] = None; clips.append(right); warnings.append(f"{sq['id']}/{tr['id']}: clip {a['id']} split around {b['id']}"); changed = True; break
-                    if changed: break
-    return warnings
+    """Atomically resolve overlaps using original list priority and source clocks."""
+    from overlap_normalization import normalize_tracks as normalize
+    try: return normalize(proj)
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
+        raise HTTPException(422, str(error)) from error
 
 def apply_ops(proj, ops):
     """ops: [{op:'set'|'insert'|'remove'|'replace_clip'|'set_clip', path, value}]; paths are JSON-pointer-like.
     Convenience: {op:'set_clip', sequence, track, clip:{...}} upserts a clip by id; {op:'remove_clip', sequence, track, clip_id}."""
     befores = []
     for o in ops:
+        if o["op"] == "set_mix":
+            import mixer_edit
+            try: befores.append(mixer_edit.apply(proj, o))
+            except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, str(error)) from error
+            continue
         if o["op"] in ("set_clip", "remove_clip"):
             seq = next(s for s in proj["sequences"] if s["id"] == o["sequence"]); tr = next(t for t in seq["tracks"] if t["id"] == o["track"])
             if o["op"] == "set_clip":
                 c = o["clip"]; c.setdefault("id", str(uuid.uuid4())[:8])
                 old = next((x for x in tr["clips"] if x["id"] == c["id"]), None); befores.append(copy.deepcopy(old))
-                if old: old.update(c)
+                if old:
+                    window = old.get("source_edit_window")
+                    if "source_edit_window" not in c and isinstance(window, dict) and window.get("version") == 1:
+                        window = copy.deepcopy(window)
+                        if "time_remap" in c and c["time_remap"] != old.get("time_remap"): window.pop("ramp", None)
+                        if "keyframes" in c:
+                            incoming = c.get("keyframes"); prior = old.get("keyframes")
+                            if (incoming.get("audio.duck_db") if isinstance(incoming, dict) else None) != (prior.get("audio.duck_db") if isinstance(prior, dict) else None): window.pop("duck", None)
+                        old["source_edit_window"] = window
+                    old.update(c)
                 else: tr["clips"].append(c)
             else:
                 old = next((x for x in tr["clips"] if x["id"] == o["clip_id"]), None); befores.append(copy.deepcopy(old))
@@ -219,100 +313,215 @@ def apply_ops(proj, ops):
 
 # ---------- media ----------
 def probe(path):
-    try: out = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path], capture_output=True, text=True, timeout=60).stdout
-    except subprocess.TimeoutExpired: out = ""
-    j = json.loads(out or "{}"); v = next((s for s in j.get("streams", []) if s["codec_type"] == "video"), None); a = next((s for s in j.get("streams", []) if s["codec_type"] == "audio"), None)
-    fps = 0.0
-    if v and "/" in v.get("avg_frame_rate", ""): n, d = v["avg_frame_rate"].split("/"); fps = float(n)/float(d) if float(d) else 0
-    nbf = int(v.get("nb_frames") or 0) if v and str(v.get("nb_frames", "")).isdigit() else 0
-    is_image = bool(v) and (v.get("codec_name") in ("png", "mjpeg", "bmp", "webp", "tiff") or "image2" in j.get("format", {}).get("format_name", "") or (v.get("codec_name") == "gif" and nbf <= 1)) and not a
-    dur = float(j.get("format", {}).get("duration", 0) or 0)
-    hdr = bool(v) and (v.get("color_transfer") in ("smpte2084", "arib-std-b67") or v.get("color_primaries") == "bt2020"); rot = 0
+    from media_metadata import summarize
     try:
-        for sd in (v or {}).get("side_data_list", []) or []:
-            if "rotation" in sd: rot = int(sd["rotation"])
-        rot = rot or int((v or {}).get("tags", {}).get("rotate", 0) or 0)
-    except (ValueError, TypeError): rot = 0
-    w_, h_ = (int(v["width"]), int(v["height"])) if v else (0, 0)
-    if rot % 180 != 0: w_, h_ = h_, w_  # display dimensions after autorotation
-    return {"hdr": hdr, "rotation": rot, "color_transfer": (v or {}).get("color_transfer"), "pix_fmt": (v or {}).get("pix_fmt"), "vcodec": (v or {}).get("codec_name"), "acodec": (a or {}).get("codec_name"), "vfr": bool(v) and v.get("r_frame_rate") != v.get("avg_frame_rate"), "duration": 5.0 if is_image else dur, "width": w_, "height": h_, "is_image": is_image,
-            "fps": 0.0 if is_image else fps, "has_video": v is not None, "has_audio": a is not None, "codec": v["codec_name"] if v else (a["codec_name"] if a else None)}
+        result = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired as error: raise ValueError("Media inspection timed out") from error
+    if result.returncode: raise ValueError("Could not inspect media: " + (result.stderr or "ffprobe failed")[-400:])
+    try: document = json.loads(result.stdout)
+    except (ValueError, TypeError) as error: raise ValueError("Media inspection returned invalid metadata") from error
+    if not isinstance(document, dict): raise ValueError("Media inspection returned invalid metadata")
+    return summarize(document)
 
 def ingest(path, name=None):
     """Fast path: probe only (≈50 ms) so imports return immediately; thumbnails, filmstrip, waveform and proxy are produced in the background
     and announced with a `media_ready` event. Media carry status: 'ingesting' → 'ready'."""
     mid = str(uuid.uuid4())[:8]; info = probe(path); os.makedirs(P("thumbs"), exist_ok=True)
-    m = {"id": mid, "name": name or os.path.basename(path), "path": os.path.abspath(path), **info, "thumb": None, "strip": None, "wave": None, "status": "ingesting", "added": time.time()}
-    threading.Thread(target=finish_ingest, args=(mid, path, info), daemon=True).start()
+    token = uuid.uuid4().hex[:12]
+    m = {"id": mid, "name": name or os.path.basename(path), "path": os.path.abspath(path), **info, "thumb": None, "strip": None, "wave": None, "status": "ingesting", "added": time.time(), "ingest_token": token}
     return mid, m
 
-def finish_ingest(mid, path, info):
-    thumb = P("thumbs", f"{mid}.jpg"); wave = P("thumbs", f"{mid}_wave.png"); upd = {}
-    try:
-        if info["has_video"]:
-            iopts = list(info.get("input_opts") or [])
-            subprocess.run(["ffmpeg", "-hide_banner", "-y"] + iopts + ([] if info.get("is_image") else ["-ss", f"{min(1.0, info['duration']/2):.2f}"]) + ["-i", path, "-frames:v", "1", "-update", "1", "-vf", "scale=320:-2", thumb], capture_output=True, timeout=180)
-            if info.get("is_image"): shutil.copy(thumb, P("thumbs", f"{mid}_strip.jpg"))
-            else: subprocess.run(["ffmpeg", "-hide_banner", "-y"] + iopts + ["-i", path, "-vf", f"fps=10/{max(info['duration'],0.1)},scale=160:-2,tile=10x1", "-frames:v", "1", "-update", "1", P("thumbs", f"{mid}_strip.jpg")], capture_output=True, timeout=600)
-            upd.update(thumb=f"/thumbs/{mid}.jpg", strip=f"/thumbs/{mid}_strip.jpg")
-        if info["has_audio"]:
-            subprocess.run(["ffmpeg", "-hide_banner", "-y", "-i", path, "-filter_complex", "showwavespic=s=1600x80:colors=0x8fb6ff", "-frames:v", "1", wave], capture_output=True, timeout=600); upd.update(wave=f"/thumbs/{mid}_wave.png")
-    except subprocess.TimeoutExpired: upd["ingest_error"] = "thumbnail generation timed out"
-    except Exception as e: upd["ingest_error"] = str(e)[-200:]
-    upd["status"] = "ready"
+def _update_ingested_media(mid, path, update, project_file, token, source_basis=None):
+    """Late ingest results belong to the captured project and source generation."""
     with LOCK:
-        proj = load_project()
-        if mid in proj["media"]: proj["media"][mid].update(upd); save_project(proj)
-    broadcast_threadsafe({"type": "media_ready", "media": [mid], "ts": time.time()})
-    if info["has_video"] and info["duration"] > 0 and not info.get("is_image"): make_proxy(mid, path, info.get("input_opts"))
-    elif info["has_audio"] and not info["has_video"] and os.path.splitext(path)[1].lower() not in WEB_AUDIO_EXT: make_audio_proxy(mid, path)
+        if not os.path.isfile(project_file): return False
+        recover_transaction(project_file)
+        with open(project_file, encoding="utf-8") as stream: proj = json.load(stream)
+        media = proj.get("media", {}).get(mid)
+        if not media or media.get("ingest_token") != token: return False
+        effective = media
+        if source_basis is not None:
+            import source_commands
+            try:
+                effective = source_commands.alias_source(proj, media)
+                if effective["audio_alias_basis"] != source_basis: return False
+            except (ValueError, KeyError, TypeError): return False
+        if os.path.abspath(effective.get("path", "")) != os.path.abspath(path): return False
+        history_path = media.get("path", path)
+        media.update(update)
+        if media.get("workflow_import"):
+            from editing_workflow import update_import_history
+            pid = os.path.basename(os.path.dirname(project_file))
+            history = update_import_history(read_undo_history(pid), mid, history_path, token, update)
+            commit_project_history(proj, history, pid)
+        else: save_project(proj, project_file)
+    if os.path.abspath(project_file) == os.path.abspath(PP("project.json")):
+        broadcast_threadsafe({"type": "media_ready", "media": [mid], "ts": time.time()})
+    return True
 
-WEB_AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".opus", ".flac", ".webm"}
-def make_audio_proxy(mid, path):
-    """AAC proxy for audio files browsers cannot play natively (AIFF, CAF, WMA, AC-3, DTS, APE, …) so the monitors always have sound."""
-    os.makedirs(P("proxies"), exist_ok=True); out = P("proxies", f"{mid}.m4a")
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-y", "-i", path, "-vn", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", out], capture_output=True, timeout=1800)
-    if r.returncode == 0:
-        with LOCK:
-            proj = load_project()
-            if mid in proj["media"]: proj["media"][mid]["proxy"] = f"/proxies/{mid}.m4a"; save_project(proj)
-        ev = log_event({"type": "proxy_ready", "actor": "system", "media": mid}); broadcast_threadsafe(ev)
+def _task_media_current(payload):
+    with LOCK:
+        try:
+            recover_transaction(payload["project_file"])
+            with open(payload["project_file"], encoding="utf-8") as stream: proj = json.load(stream)
+            media = proj.get("media", {}).get(payload["media_id"])
+            effective = media
+            if media and media.get("audio_alias"):
+                import source_commands
+                effective = source_commands.alias_source(proj, media)
+                if effective["audio_alias_basis"] != payload["info"].get("audio_alias_basis"): return False
+            return bool(media and media.get("ingest_token") == payload["token"] and os.path.abspath(effective["path"]) == os.path.abspath(payload["path"]))
+        except (OSError, ValueError, KeyError): return False
 
-def make_proxy(mid, path, input_opts=None):
-    """Low-res H.264 (yuv420p, 720p max) proxy for smooth, universally decodable preview of any source (ProRes, HEVC, MKV, AV1, image
-    sequences, VFR phone video…); recorded on the media entry when done."""
-    os.makedirs(P("proxies"), exist_ok=True); out = P("proxies", f"{mid}.mp4")
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-y"] + list(input_opts or []) + ["-i", path, "-vf", "scale='min(1280,iw)':-2,fps=30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-pix_fmt", "yuv420p", "-g", "30", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", out], capture_output=True, timeout=7200)
-    if r.returncode == 0:
-        with LOCK:
-            proj = load_project()
-            if mid in proj["media"]: proj["media"][mid]["proxy"] = f"/proxies/{mid}.mp4"; save_project(proj)
-        ev = log_event({"type": "proxy_ready", "actor": "system", "media": mid}); broadcast_threadsafe(ev)
+def _task_media_update(payload, fields):
+    return _update_ingested_media(payload["media_id"], payload["path"], fields, payload["project_file"], payload["token"], payload["info"].get("audio_alias_basis"))
+
+def _task_prepare_media(payload, task):
+    return media_preparation.prepare(ROOT, payload, task, _task_media_current, _task_media_update)
+
+def finish_ingest(mid, path, info, project_file=None, token=None):
+    """Queue preparation after registration; failure does not undo a saved import."""
+    from background_tasks import MediaTaskBusy
+    from proxy_media import settings as proxy_settings
+    project_file = project_file or PP("project.json")
+    payload = {"media_id": mid, "path": path, "info": {k:v for k,v in info.items() if k not in task_inputs.DERIVED},
+               "project_file": project_file, "token": token}
+    try:
+        settings_path = P("settings.json")
+        with open(settings_path, encoding="utf-8") as stream: prefs = json.load(stream).get("prefs") or {}
+        payload["proxy_settings"] = proxy_settings(prefs.get("proxy"))
+    except FileNotFoundError: payload["proxy_settings"] = proxy_settings()
+    except (ValueError, TypeError, OSError, AttributeError) as error:
+        _update_ingested_media(mid, path, {"ingest_error": "Cannot read proxy preferences: " + str(error)[:300], "status": "error"}, project_file, token)
+        return {"error": "Cannot read proxy preferences: " + str(error)}
+    try:
+        payload["stamp"] = task_inputs.source_stamp({**info, "path": path})
+        if info.get("source_relink_basis") is not None:
+            from source_relink_io import check_accepted
+            check_accepted({**info, "path": path})
+        previous_info = info.get("proxy_info") or {}
+        previous_source = previous_info.get("source_signature")
+        accepted_alias_source = bool(info.get("audio_alias") and previous_info.get("audio_alias_source_generation") and previous_info["audio_alias_source_generation"] != info.get("audio_alias_source_generation"))
+        if previous_source and not accepted_alias_source:
+            from media_preview import digest
+            if previous_source != digest(payload["stamp"]): raise TaskError("The source changed on disk. Relink it to inspect and accept its current timing and format before preparing a proxy.")
+        if TASKS is None: raise TaskError("Background task service is unavailable")
+        return TASKS.submit("media", info.get("name") or os.path.basename(path),
+            {"workspace": workspace_id(ROOT), "project": os.path.basename(os.path.dirname(project_file))}, payload)
+    except MediaTaskBusy as error: return {"error": str(error)}
+    except Exception as error:
+        _update_ingested_media(mid, path, {"status":"error", "ingest_error":"Could not queue preparation: " + str(error)[:300]}, project_file, token)
+        return {"error": str(error)}
 
 # ---------- API ----------
+@app.exception_handler(TransactionRecoveryRequired)
+@app.exception_handler(ProjectRecoveryRequired)
+async def project_recovery_required(req: Request, error: ProjectRecoveryRequired):
+    return JSONResponse({"detail": {"code": "project_recovery_required", "message": str(error)}}, status_code=409)
+
 @app.get("/", response_class=HTMLResponse)
-def index(): return open(os.path.join(FRONT, "index.html")).read()
+def index():
+    with open(os.path.join(FRONT, "index.html"), encoding="utf-8") as stream:
+        return stream.read()
 
 @app.get("/api/project")
-def get_project(): return load_project()
+def get_project():
+    with LOCK: return load_project()
+
+@app.get("/api/project/state")
+def get_project_state():
+    from project_lifecycle import COPY_WORKER
+    from media_preview import catalog
+    with LOCK:
+        pid = active_id(); proj = load_project()
+        return {"project": proj, "context": project_context(ROOT, pid, proj), "media_availability": catalog(ROOT, proj), "project_action_busy": COPY_WORKER.busy}
+
+def require_project_context(body, pid, proj):
+    if "_context" in body and not matches_context(body["_context"], project_context(ROOT, pid, proj)):
+        raise HTTPException(409, {"code": "project_changed", "message": "The saved project changed. Your editor copy has been kept; review it in Recovery before continuing."})
+
+@app.get("/api/projects/recovery")
+def project_recovery_versions(project: str = None):
+    from project_lifecycle import project_file
+    with LOCK:
+        pid = project or active_id()
+        try: path = project_file(ROOT, pid)
+        except ValueError as error: raise HTTPException(400, str(error)) from error
+        origin = project_context(ROOT, active_id(), load_project()) if pid != active_id() else None
+        return {"project": pid, "workspace": workspace_id(ROOT), "origin_context": origin, **inspect_recovery(path)}
+
+@app.post("/api/projects/recovery")
+async def project_recovery_restore(req: Request):
+    body = await req.json()
+    with LOCK:
+        pid = active_id()
+        if "_context" in body: require_project_context(body, pid, load_project())
+        if body.get("project") != pid:
+            if not body.get("_context"): raise HTTPException(409, "The active project changed. Refresh recovery versions before restoring.")
+            require_project_context(body, pid, load_project())
+            pid = body["project"]
+        try:
+            from project_lifecycle import project_file as checked_project_file
+            project_file = str(checked_project_file(ROOT, pid))
+            candidate, sha = body.get("candidate"), body.get("sha256")
+            if "draft_project" in body:
+                if body.get("workspace") != workspace_id(ROOT): raise RecoveryConflict("The browser draft belongs to a different workspace.")
+                if body.get("current_sha256") != inspect_recovery(project_file)["current_sha256"]:
+                    raise RecoveryConflict("The current project changed. Refresh recovery versions before restoring.")
+                candidate, sha = preserve_editor_draft(project_file, body["draft_project"])
+            result = restore_version(project_file, candidate, sha,
+                                     body.get("current_sha256"), save_project, body.get("editor_project"))
+        except RecoveryConflict as error:
+            raise HTTPException(409, str(error)) from error
+        except (RecoveryError, TypeError, ValueError) as error:
+            raise HTTPException(422, str(error)) from error
+        except OSError as error:
+            raise HTTPException(500, "Cannot preserve or restore the project: " + str(error)[:500]) from error
+        event = {"type": "project_replaced", "source": "recovery", "actor": "human", "project": pid}
+        try: log_event(event, project_id=pid)
+        except Exception as error: result["warning"] = (result.get("warning", "") + "; " if result.get("warning") else "") + "Project restored, but history could not be recorded: " + str(error)[:300]
+    await broadcast(event)
+    return result
 
 @app.put("/api/project")
 async def put_project(req: Request):
     body = await req.json()
-    with LOCK: save_project(body)
-    ev = log_event({"type": "project_replaced", "actor": body.get("_actor", "human"), "source": body.get("_source", "ui")}); await broadcast(ev); return {"ok": True}
+    with LOCK:
+        pid = active_id(); before = load_project(); require_project_context(body, pid, before)
+        document = {key: value for key, value in body.items() if key not in ("_context", "_actor", "_source", "_client")}
+        try: parse_project(json.dumps(document, allow_nan=False).encode("utf-8"))
+        except (RecoveryError, TypeError, ValueError) as error: raise HTTPException(422, str(error)) from error
+        commit_warning = commit_edit(before, document, pid, {"ops": [], "actor": body.get("_actor", "human"), "reason": "replace project", "ts": time.time()})
+        context = project_context(ROOT, pid, document)
+        ev = {"type": "project_replaced", "actor": body.get("_actor", "human"), "source": body.get("_source", "ui"), "client": body.get("_client"), "project": pid}
+        warning = commit_warning
+        try: log_event(ev, project_id=pid)
+        except OSError as error: warning = (warning + "; " if warning else "") + "Project saved; event history could not be recorded: " + str(error)[:300]
+    await broadcast({**ev, "context": context})
+    return {"ok": True, "context": context, "warning": warning}
 
 @app.patch("/api/project")
 async def patch_project(req: Request):
     body = await req.json(); ops = body.get("ops", []); actor = body.get("actor", "human")
+    if isinstance(ops, list) and any(isinstance(o, dict) and o.get("op") == "set_mix" for o in ops) and "_context" not in body:
+        raise HTTPException(400, "Mixer edits require the saved project context")
     if actor != "human":
-        try: mode = (json.load(open(P("settings.json"))).get("agent_mode") if os.path.exists(P("settings.json")) else None) or "direct"
-        except Exception: mode = "direct"
+        try:
+            with open(P("settings.json"), encoding="utf-8") as settings_file: mode = json.load(settings_file).get("agent_mode") or "direct"
+        except FileNotFoundError: mode = "direct"
+        except (OSError, ValueError, TypeError, AttributeError):
+            return JSONResponse({"ok": False, "errors": ["Could not read agent editing preferences; repair settings before direct edits"]}, status_code=403)
         if mode == "proposals_only": return JSONResponse({"ok": False, "errors": ["agent_mode is proposals_only: submit these ops as a proposal (POST /api/proposals) for the human to accept"], "agent_mode": mode}, status_code=403)
     with LOCK:
-        proj = load_project(); problems = validate_ops(proj, ops)
+        pid = active_id(); proj = load_project(); require_project_context(body, pid, proj)
+        problems = validate_ops(proj, ops)
         if problems: return JSONResponse({"ok": False, "errors": problems}, status_code=422)
-        befores = apply_ops(proj, ops); warnings = normalize_tracks(proj) if body.get("normalize", True) else []; save_project(proj)
+        before = copy.deepcopy(proj)
+        befores = apply_ops(proj, ops); warnings = normalize_tracks(proj) if body.get("normalize", True) and not (ops and all(o.get("op") == "set_mix" for o in ops)) else []
+        try: parse_project(json.dumps(proj, allow_nan=False).encode("utf-8"))
+        except (RecoveryError, TypeError, ValueError) as error: raise HTTPException(422, str(error)) from error
+        entry = None if body.get("_no_undo") else {"ops": ops, "befores": befores, "actor": actor, "reason": body.get("reason") or body.get("tool"), "ts": time.time()}
+        commit_warning = commit_edit(before, proj, pid, entry)
         touched = {}
         for o in ops:
             if o.get("op") in ("set_clip", "remove_clip"): touched.setdefault(o["sequence"], set()).add(o["track"])
@@ -320,32 +529,57 @@ async def patch_project(req: Request):
             try: sq_, tr_ = w.split(":")[0].split("/"); touched.setdefault(sq_, set()).add(tr_)
             except ValueError: pass
         applied = {sid: {tid: next((t["clips"] for sq in proj["sequences"] if sq["id"] == sid for t in sq["tracks"] if t["id"] == tid), None) for tid in tids} for sid, tids in touched.items()}
-    LAST_OPS_TS["t"] = time.time()
-    if not body.get("_no_undo"): undo_push({"ops": ops, "befores": befores, "actor": actor, "reason": body.get("reason") or body.get("tool"), "ts": time.time()})
-    ev = log_event({"type": "ops", "actor": actor, "tool": body.get("tool"), "reason": body.get("reason"), "ops": ops, "befores": befores, "client": body.get("client"), "warnings": warnings})
-    global OPS_SINCE_AUTOSAVE; OPS_SINCE_AUTOSAVE += 1
-    if OPS_SINCE_AUTOSAVE >= 25:
-        OPS_SINCE_AUTOSAVE = 0; os.makedirs(PP("snapshots"), exist_ok=True); json.dump(proj, open(PP("snapshots", f"{int(time.time())}_autosave.json"), "w"))
-    await broadcast({**{k: v for k, v in ev.items() if k != "befores"}, "applied": applied}); return {"ok": True, "event_id": ev["id"], "warnings": warnings, "applied": applied}
+        context = project_context(ROOT, pid, proj)
+        LAST_OPS_TS["t"] = time.time()
+        # Keep history/snapshots with the same locked project. A secondary
+        # history error must not make the UI retry an already committed edit.
+        notice = [commit_warning] if commit_warning else []
+        ev = {"id": str(uuid.uuid4())[:8], "type": "ops", "project": pid, "actor": actor, "tool": body.get("tool"), "reason": body.get("reason"), "ops": ops, "befores": befores, "client": body.get("client"), "warnings": warnings}
+        try: log_event(ev, project_id=pid)
+        except OSError as error: notice.append("Event history could not be recorded: " + str(error)[:200])
+        global OPS_SINCE_AUTOSAVE; OPS_SINCE_AUTOSAVE += 1
+        if OPS_SINCE_AUTOSAVE >= 25:
+            OPS_SINCE_AUTOSAVE = 0
+            try:
+                write_snapshot(P("projects", pid, "project.json"), proj, "autosave")
+            except OSError as error: notice.append("Autosave snapshot could not be recorded: " + str(error)[:200])
+    try: await broadcast({**{k: v for k, v in ev.items() if k != "befores"}, "applied": applied, "context": context})
+    except Exception: notice.append("Saved; another editor may need to refresh")
+    return {"ok": True, "event_id": ev["id"], "warnings": warnings, "applied": applied, "context": context, "warning": "; ".join(notice)}
 
 @app.post("/api/media/import")
 async def media_import(req: Request):
     body = await req.json(); added = []
     with LOCK:
-        proj = load_project()
+        proj = load_project(); project_file = PP("project.json")
         for path in body.get("paths", []):
             if not os.path.exists(path): raise HTTPException(404, f"not found: {path}")
             mid, m = await asyncio.to_thread(ingest, path); proj["media"][mid] = m; added.append(m)
         save_project(proj)
+    for m in added: finish_ingest(m["id"], m["path"], m, project_file, m["ingest_token"])
     ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": [m["id"] for m in added]}); await broadcast(ev); return {"added": added}
 
 @app.post("/api/media/upload")
 async def media_upload(file: UploadFile = File(...)):
-    os.makedirs(P("media"), exist_ok=True); dest = P("media", f"{int(time.time())}_{file.filename}")
-    with open(dest, "wb") as f: shutil.copyfileobj(file.file, f)
+    from upload_storage import OwnedUpload, UploadError, display_name, suffix
+    name = display_name(file.filename)
     with LOCK:
-        proj = load_project(); mid, m = await asyncio.to_thread(ingest, dest, file.filename); proj["media"][mid] = m; save_project(proj)
-    ev = log_event({"type": "media_added", "actor": "human", "media": [mid]}); await broadcast(ev); return m
+        pid = active_id(); proj = load_project(); expected = project_context(ROOT, pid, proj)
+    try:
+        with OwnedUpload(ROOT, "media", file.file, suffix(name)) as upload:
+            mid, m = await _owned_render_thread(lambda proc_holder=None: ingest(str(upload.path), name))
+            with LOCK:
+                proj = load_project(); require_project_context({"_context": expected}, active_id(), proj)
+                project_file = PP("project.json"); proj["media"][mid] = m
+                # A failed save may have a recoverable pending document. Retain
+                # its newly owned media before the uncertain commit boundary.
+                upload.retain(); save_project(proj)
+    except UploadError as error:
+        raise HTTPException(400, str(error)) from error
+    except (ValueError, OSError) as error:
+        raise HTTPException(400, "Could not read uploaded media: " + str(error)[:400]) from error
+    finish_ingest(mid, m["path"], m, project_file, m["ingest_token"])
+    ev = log_event({"type": "media_added", "actor": "human", "media": [mid]}, project_id=pid); await broadcast(ev); return m
 
 def _range_stream(path, start, end, chunk=1 << 20):
     with open(path, "rb") as f:
@@ -357,29 +591,44 @@ def _range_stream(path, start, end, chunk=1 << 20):
 
 @app.get("/api/media/file/{mid}")
 def media_file(mid: str, request: Request):
-    proj = load_project(); m = proj["media"].get(mid)
-    if not m: raise HTTPException(404)
-    path = m["path"]
-    # Proxy fallback, added 2026-09-07. m["proxy"] records that a proxy was
-    # MADE, not that it is still there. It is absent whenever a project moves
-    # machines (proxies live in the data dir, not beside the project), while
-    # generation is still running, or after the data dir is cleared. Without
-    # the exists() check getsize() raises and the clip 500s, which the editor
-    # renders as a black program monitor -- indistinguishable from a broken
-    # decode, and the reason this was hunted for hours. Fall back to the
-    # original, which is always playable if it is present at all.
-    if request.query_params.get("proxy") == "1" and m.get("proxy"):
-        _px = P("proxies", os.path.basename(m["proxy"]))
-        if os.path.exists(_px): path = _px
-    if not os.path.exists(path):
-        raise HTTPException(404, f"media file missing on this machine: {path} — use Relink to point at it")
-    size = os.path.getsize(path); mt = mimetypes.guess_type(path)[0] or "application/octet-stream"
-    rng = request.headers.get("range")
-    if rng:
-        s, e = rng.replace("bytes=", "").split("-"); start = int(s); end = int(e) if e else size - 1
-        return StreamingResponse(_range_stream(path, start, end), status_code=206, media_type=mt,
-                                 headers={"Content-Range": f"bytes {start}-{end}/{size}", "Accept-Ranges": "bytes", "Content-Length": str(end - start + 1)})
-    return FileResponse(path, media_type=mt, headers={"Accept-Ranges": "bytes"})
+    from media_preview import resolve, byte_range, PreviewError, file_stamp
+    with LOCK:
+        pid = active_id(); proj = load_project()
+        try: path, expected_stamp, headers = resolve(ROOT, proj, mid, request.query_params, workspace=workspace_id(ROOT), project_id=pid)
+        except PreviewError as error: raise HTTPException(error.status, str(error)) from error
+        except OSError as error: raise HTTPException(404, "Preview media is unavailable. Refresh media status.") from error
+        # Open the selected generation now. A later project switch or pathname
+        # replacement cannot redirect this response to a different file.
+        try: stream = open(path, "rb"); size = os.fstat(stream.fileno()).st_size
+        except OSError as error: raise HTTPException(404, "Preview media is unavailable. Refresh media status.") from error
+        try:
+            st = os.fstat(stream.fileno())
+            if [st.st_size, st.st_mtime_ns, st.st_ino] != expected_stamp or file_stamp(path) != expected_stamp: raise PreviewError("Media changed while opening the preview")
+            rng = request.headers.get("range")
+            if request.headers.get("if-range") not in (None, headers['ETag']): rng = None
+            bounds = byte_range(rng, size)
+        except PreviewError as error:
+            stream.close()
+            if error.status == 416: return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+            raise HTTPException(error.status, str(error)) from error
+        except Exception:
+            stream.close(); raise
+    start, end = bounds if bounds else (0, size-1)
+    headers['Content-Length'] = str(end-start+1)
+    if bounds: headers['Content-Range'] = f"bytes {start}-{end}/{size}"
+    def chunks():
+        try:
+            stream.seek(start); left = end-start+1
+            while left > 0:
+                current = os.fstat(stream.fileno())
+                if [current.st_size, current.st_mtime_ns, current.st_ino] != expected_stamp: raise OSError("Media changed during playback; refresh media status")
+                chunk = stream.read(min(left, 1 << 20))
+                if not chunk: break
+                left -= len(chunk); yield chunk
+        finally: stream.close()
+    from media_response import owned_stream
+    return owned_stream(StreamingResponse, stream, chunks(), status_code=206 if bounds else 200,
+        media_type=mimetypes.guess_type(path)[0] or "application/octet-stream", headers=headers)
 
 @app.get("/api/events")
 def events(since: float = 0, limit: int = 500):
@@ -400,18 +649,32 @@ async def annotate(req: Request):
 
 @app.post("/api/snapshot")
 async def snapshot(req: Request):
-    """Save a labeled snapshot of the project (e.g., label='agent_proposal' or 'human_final'). When a human_final follows an
-    agent_proposal for the same sequence, a diff pair is appended to training/edit_pairs.jsonl."""
-    body = await req.json(); label = body.get("label", "snapshot"); actor = body.get("actor", "human"); seq_id = body.get("sequence", "seq1")
-    os.makedirs(PP("snapshots"), exist_ok=True); os.makedirs(PP("training"), exist_ok=True)
-    proj = load_project(); sid = f"{int(time.time())}_{label}"; json.dump(proj, open(PP("snapshots", f"{sid}.json"), "w"))
-    pair = None
-    if label == "human_final":
-        props = sorted([f for f in os.listdir(PP("snapshots")) if "agent_proposal" in f])
-        if props:
-            a = json.load(open(PP("snapshots", props[-1]))); pair = diff_sequences(a, proj, seq_id); pair.update({"agent_snapshot": props[-1], "human_snapshot": sid + ".json", "ts": time.time()})
-            with open(PP("training", "edit_pairs.jsonl"), "a") as f: f.write(json.dumps(pair) + "\n")
-    ev = log_event({"type": "snapshot", "label": label, "actor": actor, "snapshot": sid}); await broadcast(ev); return {"snapshot": sid, "pair": pair}
+    """Save the captured project; audit/training failures do not undo the snapshot."""
+    body = await req.json(); label = body.get("label", "snapshot"); actor = body.get("actor", "human")
+    with LOCK:
+        pid = active_id(); proj = load_project(); require_project_context(body, pid, proj)
+        project_file = P("projects", pid, "project.json")
+        try: saved = write_snapshot(project_file, proj, label)
+        except (RecoveryError, TypeError, ValueError) as error: raise HTTPException(422, str(error)) from error
+        pair, notices = None, []
+        if label == "human_final":
+            try:
+                versions = list_versions(project_file, "snapshots", label="agent_proposal")["versions"]
+                previous = next((v for v in versions if v["label"] == "agent_proposal"), None)
+                if previous:
+                    a, _ = read_version(project_file, "snapshots", previous["file"], previous["sha256"])
+                    pair = diff_sequences(a, proj, body.get("sequence", "seq1"))
+                    pair.update(agent_snapshot=previous["file"], human_snapshot=saved["file"], ts=time.time())
+                    os.makedirs(P("projects", pid, "training"), exist_ok=True)
+                    with open(P("projects", pid, "training", "edit_pairs.jsonl"), "a", encoding="utf-8") as stream: stream.write(json.dumps(pair) + "\n")
+            except Exception as error: notices.append("Snapshot saved, but the training pair could not be recorded: " + str(error)[:200])
+        context = project_context(ROOT, pid, proj)
+        ev = {"type": "snapshot", "project": pid, "label": label, "actor": actor, "snapshot": saved["file"][:-5], "client": body.get("client")}
+        try: log_event(ev, project_id=pid)
+        except OSError as error: notices.append("Snapshot saved, but event history could not be recorded: " + str(error)[:200])
+    try: await broadcast(ev)
+    except Exception as error: notices.append("Snapshot saved, but notification failed: " + str(error)[:200])
+    return {"ok": True, "snapshot": saved["file"][:-5], "pair": pair, "context": context, "sha256": saved["sha256"], "warning": "; ".join(notices)}
 
 def diff_sequences(a, b, seq_id):
     def clips(p):
@@ -436,54 +699,213 @@ def diff_sequences(a, b, seq_id):
 
 import queue as _queue
 RENDER_Q = _queue.Queue(); RENDER_WORKERS = []; RENDER_PROCS = {}
+RENDER_STATE_LOCK = threading.RLock()
+SHUTDOWN = threading.Event()
+
+
+async def _owned_render_thread(function, *args, **kwargs):
+    """Request cancellation signals and joins the real thread; to_thread alone does not."""
+    holder = kwargs.setdefault("proc_holder", {})
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        holder["cancelled"] = True
+        # Repeated cancellation still cannot abandon a live encoder/reader.
+        while not task.done():
+            try: await asyncio.shield(task)
+            except asyncio.CancelledError: continue
+            except Exception: break
+        if not task.cancelled():
+            error = task.exception()
+            if error and holder.get("scratch_diagnostics"):
+                raise RuntimeError(str(error)) from error
+        raise
 LAST_OPS_TS = {"t": 0.0}
+def autosave_tick():
+    with LOCK:
+        mins = int(((json.load(open(P("settings.json"))).get("prefs") or {}).get("autosave_minutes", 5)) if os.path.exists(P("settings.json")) else 5)
+        if mins <= 0 or not LAST_OPS_TS["t"]: return
+        pid = active_id(); project_file = P("projects", pid, "project.json")
+        last = [v for v in list_versions(project_file, "snapshots", label="autosave")["versions"] if v["label"] == "autosave"]
+        if not last or time.time() - last[0]["ts"] >= mins * 60:
+            if time.time() - LAST_OPS_TS["t"] < mins * 60 * 2:
+                write_snapshot(project_file, load_project(), "autosave")
+                # Keep the newest 20 automatic versions, including this one.
+                from project_versions import version_path
+                for old in last[19:]: version_path(project_file, "snapshots", old["file"]).unlink()
+
 def _autosave_loop():
-    while True:
-        time.sleep(60)
-        try:
-            mins = int(((json.load(open(P("settings.json"))).get("prefs") or {}).get("autosave_minutes", 5)) if os.path.exists(P("settings.json")) else 5)
-            if mins <= 0 or not LAST_OPS_TS["t"]: continue
-            d = PP("snapshots"); os.makedirs(d, exist_ok=True); last = sorted(f for f in os.listdir(d) if f.endswith("_autosave.json"))
-            if not last or time.time() - float(last[-1].split("_")[0]) >= mins * 60:
-                if time.time() - LAST_OPS_TS["t"] < mins * 60 * 2: json.dump(load_project(), open(os.path.join(d, f"{int(time.time())}_autosave.json"), "w"))
-                for old in last[:-20]: os.remove(os.path.join(d, old))
+    while not SHUTDOWN.wait(60):
+        try: autosave_tick()
         except Exception: pass
-threading.Thread(target=_autosave_loop, daemon=True).start()
+AUTOSAVE_THREAD = threading.Thread(target=_autosave_loop, name="Filmocity autosave", daemon=True)
+AUTOSAVE_THREAD.start()
 
 def render_workers():
     """Render queue: exports run sequentially by default (like a render queue), or N at a time via settings.prefs.render_workers."""
-    try: n = int((json.load(open(P("settings.json"))).get("prefs") or {}).get("render_workers", 1)) if os.path.exists(P("settings.json")) else 1
-    except Exception: n = 1
+    try:
+        with open(P("settings.json"), encoding="utf-8") as stream:
+            n = int((json.load(stream).get("prefs") or {}).get("render_workers", 1))
+    except (OSError, ValueError, TypeError): n = 1
     n = max(1, min(4, n))
-    while len(RENDER_WORKERS) < n:
-        t = threading.Thread(target=_render_worker, daemon=True); t.start(); RENDER_WORKERS.append(t)
+    with RENDER_STATE_LOCK:
+        if globals().get("SHUTDOWN") and SHUTDOWN.is_set():
+            raise HTTPException(503, "Exports are shutting down")
+        RENDER_WORKERS[:] = [worker for worker in RENDER_WORKERS if worker.is_alive()]
+        while len(RENDER_WORKERS) < n:
+            worker = threading.Thread(target=_render_worker, name="filmocity-render", daemon=True)
+            worker.start(); RENDER_WORKERS.append(worker)
+
+def _record_render_event(job, actor):
+    """Audit persistence is independent of the render result and queue ownership."""
+    try:
+        event = {"type": "render", "actor": actor, "job": {k: v for k, v in job.items() if k != "preset"}}
+        captured = job.get("context") or (job.get("preview") or {}).get("context")
+        if captured: log_event(event, project_id=captured["project"])
+        else: log_event(event)
+    except Exception as error:
+        # Do not retry via the failed event store or overwrite an encoder/cancel
+        # error. Keep a bounded, visible diagnostic on the in-memory job instead.
+        detail = f"{type(error).__name__}: {error}"[:500]
+        message = f"Render event persistence failed; audit record not confirmed: {detail}"
+        job["event_persistence"] = {"status": "error", "error": detail}
+        diagnostics = job.get("diagnostics")
+        job["diagnostics"] = (diagnostics[-7:] if isinstance(diagnostics, list) else []) + [{"phase": "event_persistence", "message": message}]
+        qa = job.get("qa")
+        if not isinstance(qa, dict):
+            qa = job["qa"] = {"status": "warnings", "flags": []}
+        flags = qa.get("flags")
+        qa["flags"] = (flags if isinstance(flags, list) else []) + [message]
+        if qa.get("status") != "error": qa["status"] = "warnings"
+    else:
+        job["event_persistence"] = {"status": "recorded"}
 
 def _render_worker():
+    from job_history import remember
     while True:
-        jid, proj, seq_id, preset, name, actor, out = RENDER_Q.get()
-        if JOBS.get(jid, {}).get("status") == "error": RENDER_Q.task_done(); continue  # cancelled while queued
-        JOBS[jid].update(status="running", started_run=time.time(), progress=0.0)
+        item = RENDER_Q.get()
+        if item is None:
+            RENDER_Q.task_done()
+            return
+        jid = None; job = None; completion = None
         try:
-            holder = {"last": time.time()}; RENDER_PROCS[jid] = holder
-            def _watch(h=holder, j=jid):
-                while j in JOBS and JOBS[j]["status"] in ("running", "cancelling"):
-                    time.sleep(30)
-                    if time.time() - h.get("last", time.time()) > 900 and h.get("proc") and h["proc"].poll() is None: h["cancelled"] = True; JOBS[j]["error"] = "stalled: no progress for 15 minutes"; h["proc"].kill(); break
-            threading.Thread(target=_watch, daemon=True).start()
-            with open(P("renders", f"{name}.cmd.txt"), "w") as log:
+            jid, proj, seq_id, preset, name, actor, out = item
+            with RENDER_STATE_LOCK:
+                job = JOBS.get(jid)
+                if job is None or job.get("status") == "error": continue  # removed or cancelled while queued
+                holder = {"last": time.time()}; RENDER_PROCS[jid] = holder
+                job.update(status="running", started_run=time.time(), progress=0.0)
+                remember(ROOT, job)
+            require_resources(proj, seq_id, preset)
+            if holder.get("cancelled"): raise RuntimeError("cancelled")
+            from export_storage import filesystem_path
+            with open(filesystem_path(os.path.join(os.path.dirname(out), f"{name}.cmd.txt")), "x", encoding="utf-8") as log:
                 prog = lambda f, j=jid, h=holder: (JOBS[j].update(progress=round(f, 3)), h.update(last=time.time()))
-                if preset.get("incremental", True) and preset.get("format", "h264") in ("h264", "hevc") and not preset.get("range"):
-                    _, stats = render_incremental(proj, seq_id, out, preset, log, progress=prog, proc_holder=holder, cache_dir=P("renders", "cache")); JOBS[jid].update(stats)
+                if preset.get("incremental", False) and preset.get("format", "h264") in ("h264", "hevc") and not preset.get("range"):
+                    _, stats = render_incremental(proj, seq_id, out, preset, log, progress=prog, proc_holder=holder, cache_dir=P("renders", "cache")); job.update(stats)
                 else: do_render(proj, seq_id, out, preset, log, progress=prog, proc_holder=holder)
-            JOBS[jid].update(status="done", finished=time.time(), qa=render_qa(out, preset))
-        except Exception as e: JOBS[jid].update(status="error", error=str(e)[-2000:])
-        log_event({"type": "render", "actor": actor, "job": {k: v for k, v in JOBS[jid].items() if k != "preset"}})
-        RENDER_Q.task_done()
+            qa = holder["sequence_qa"] if preset.get("format") == "png_sequence" else render_qa(out, preset, proc_holder=holder)
+            cleanup = job.get("cache_cleanup") or {}
+            if cleanup.get("errors") or cleanup.get("status") == "deferred":
+                qa.setdefault("flags", []).append("Segment cache retention was deferred or incomplete; inspect cache_cleanup in this export receipt.")
+                if qa.get("status") != "error": qa["status"] = "warnings"
+            completion = {"status": "done", "finished": time.time(), "qa": qa}
+        except Exception as error:
+            if job is not None:
+                # Direct assignments also recover a failure in job.update itself.
+                completion = {"status": "error", "error": job.get("error") or str(error)[-2000:], "finished": time.time()}
+                diagnostics = RENDER_PROCS.get(jid, {}).get("scratch_diagnostics")
+                if diagnostics: completion["diagnostics"] = (job.get("diagnostics", []) + diagnostics)[-8:]
+        finally:
+            try:
+                if job is not None:
+                    # A polling client must not stop at a terminal status before
+                    # the final receipt attempt and its warnings are observable.
+                    with RENDER_STATE_LOCK:
+                        for key, value in (completion or {}).items(): job[key] = value
+                        _record_render_event(job, actor)
+                        remember(ROOT, job)
+            finally:
+                try: RENDER_PROCS.pop(jid, None)
+                finally: RENDER_Q.task_done()  # exactly once for every acquired item
 
-def start_render(proj, seq_id, preset, name, actor):
-    os.makedirs(P("renders"), exist_ok=True); fmt_ = preset.get("format", "h264"); ext_ = "mov" if (fmt_ in ("h264", "hevc") and preset.get("container") == "mov") else ("mp4" if fmt_ in ("h264", "hevc", "av1") else {"prores": "mov", "gif": "gif", "png_sequence": "png", "webm": "webm", "audio": preset.get("acodec", "wav")}.get(fmt_, "mp4")); out = P("renders", f"{name}.{ext_}"); jid = str(uuid.uuid4())[:8]
-    JOBS[jid] = {"id": jid, "status": "queued", "out": "/renders/" + os.path.basename(out), "name": name, "started": time.time(), "preset": preset}
-    render_workers(); RENDER_Q.put((jid, proj, seq_id, preset, name, actor, out)); return JOBS[jid]
+def check_render_resources(proj, seq_id, preset):
+    report = inspect_resources(proj, seq_id, preset)
+    if not report["ok"]: raise HTTPException(422, {"message": "Resolve export resources before rendering.", **report})
+    return report
+
+def inspect_export_resources(proj, seq_id, preset):
+    from encoder_capabilities import inspect_export
+    return inspect_export(proj, seq_id, preset)
+
+
+def check_export_resources(proj, seq_id, preset):
+    report = inspect_export_resources(proj, seq_id, preset)
+    if not report["ok"]: raise HTTPException(422, {"message": "Resolve export issues before rendering.", **report})
+    return report
+
+
+def start_render(proj, seq_id, preset, name, actor, preflight=None, *, preview=None, request_id=None, context=None):
+    from export_storage import reserve_export
+    from job_history import remember, discard_unqueued
+    # Queued work owns its input values even for internal callers passing a live
+    # document or a preset reused by another job.
+    proj, preset = copy.deepcopy(proj), copy.deepcopy(preset)
+    from timeline_time import frame_range, from_frames
+    sequence = next((s for s in proj["sequences"] if s["id"] == seq_id), None)
+    # A supplied report cannot admit a sequence absent from the captured document.
+    # Keep the existing structured preflight refusal before any range/output work.
+    preflight = copy.deepcopy(preflight if sequence is not None and preflight
+                              else check_render_resources(proj, seq_id, preset))
+    review_start = 0
+    if preset.get("range"):
+        try:
+            first, _ = frame_range(sequence.get("in_point"), sequence.get("out_point"), sequence["fps"])
+            review_start = from_frames(first, sequence["fps"])
+        except ValueError as error: raise HTTPException(422, str(error)) from error
+    try: destination = reserve_export(P("renders"), name, preset)
+    except ValueError as error: raise HTTPException(422, str(error))
+    except OSError as error: raise HTTPException(503, "Could not reserve export output: " + str(error))
+    jid, name, out = destination["id"], destination["name"], destination["path"]
+    job = {"id": jid, "status": "queued", "out": destination["url"], "name": name,
+           "started": time.time(), "actor": actor, "preset": copy.deepcopy(preset), "sequence": seq_id, "preflight": preflight,
+           "command_log": destination["url"].rsplit(".", 1)[0] + ".cmd.txt", "review_url": "/review/job-" + jid}
+    sequence = next(s for s in proj["sequences"] if s["id"] == seq_id)
+    job["review_start"] = review_start
+    if context is not None: job["context"] = copy.deepcopy(context)
+    if preview is not None:
+        job["preview"] = copy.deepcopy(preview)
+        job["preview_request"] = request_id
+    if preset.get("format") == "png_sequence":
+        directory = destination["url"].rsplit(".", 1)[0] + ".frames"
+        job.update(out=directory + "/sequence.json", output_kind="png_sequence",
+                   frames={"directory": directory, "pattern": "frame_%05d.png", "first_frame": directory + "/frame_00001.png"})
+    receipt = None
+    try:
+        render_workers()
+        with RENDER_STATE_LOCK:
+            if globals().get("SHUTDOWN") and SHUTDOWN.is_set():
+                raise HTTPException(503, "Exports are shutting down")
+            if jid in JOBS: raise RuntimeError("Export job identity already exists.")
+            try: receipt = remember(ROOT, job, required=True)
+            except (OSError, ValueError, TypeError) as error:
+                raise HTTPException(503, "Cannot save export history before starting: " + str(error)[:300]) from error
+            JOBS[jid] = job
+            try: RENDER_Q.put_nowait((jid, proj, seq_id, preset, name, actor, out))
+            except Exception:
+                JOBS.pop(jid, None)
+                raise
+    except Exception:
+        # No queue entry owns this folder. Remove only an empty reservation;
+        # never recursively delete files another actor may have placed there.
+        try: discard_unqueued(ROOT, job, receipt)
+        except (OSError, ValueError): pass
+        try: os.rmdir(destination["directory"])
+        except OSError: pass
+        raise
+    return job
+
 
 PLATFORM_RULES = {  # delivery specs: max seconds, max MB, required aspect (w/h), notes — checked on every export against preset.platform
     "reels": {"max_s": 90, "max_mb": 4000, "aspect": (9, 16), "min_short_side": 1080},
@@ -495,48 +917,65 @@ PLATFORM_RULES = {  # delivery specs: max seconds, max MB, required aspect (w/h)
     "facebook": {"max_s": 240 * 60, "max_mb": 10000, "aspect": None, "min_short_side": 720},
     "stories": {"max_s": 60, "max_mb": 4000, "aspect": (9, 16), "min_short_side": 1080}}
 
-def render_qa(path, preset=None):
+def render_qa(path, preset=None, *, proc_holder=None):
     """Post-render checks: spec via ffprobe, integrated loudness / true peak via ebur128, plus platform delivery rules when the preset
     names a platform (reels, tiktok, shorts, youtube, linkedin, x, facebook, stories). Returned on the job and logged."""
+    from work_budget import work
     qa = {}
     try:
-        j = json.loads(subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path], capture_output=True, text=True).stdout or "{}")
-        v = next((x for x in j.get("streams", []) if x["codec_type"] == "video"), {}); a = next((x for x in j.get("streams", []) if x["codec_type"] == "audio"), {})
-        qa.update(width=v.get("width"), height=v.get("height"), vcodec=v.get("codec_name"), acodec=a.get("codec_name"), duration=round(float(j.get("format", {}).get("duration", 0) or 0), 3), size_mb=round(os.path.getsize(path) / 1e6, 2))
-        if a:
-            r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", path, "-filter_complex", "ebur128=peak=true", "-f", "null", "-"], capture_output=True, text=True, timeout=600).stderr
-            import re as _re; tail = r.split("Summary:")[-1]
-            m = _re.search(r"I:\s+(-?[\d.]+) LUFS", tail); tp = _re.search(r"Peak:\s+(-?[\d.]+) dBFS", tail); lra = _re.search(r"LRA:\s+([\d.]+) LU", tail)
-            if m: qa["integrated_lufs"] = float(m.group(1))
-            if tp: qa["true_peak_dbtp"] = float(tp.group(1))
-            if lra: qa["lra_lu"] = float(lra.group(1))
-        flags = []
-        if qa.get("integrated_lufs") is not None and not (-16.5 <= qa["integrated_lufs"] <= -12.5): flags.append(f"loudness {qa['integrated_lufs']} LUFS (target -14 ±1.5 for social)")
-        if qa.get("true_peak_dbtp") is not None and qa["true_peak_dbtp"] > -1.0: flags.append(f"true peak {qa['true_peak_dbtp']} dBTP (> -1.0)")
-        plat = (preset or {}).get("platform"); rules = PLATFORM_RULES.get(str(plat).lower()) if plat else None
-        if rules:
-            qa["platform"] = plat
-            if qa.get("duration") and qa["duration"] > rules["max_s"]: flags.append(f"{plat}: {qa['duration']}s exceeds the {rules['max_s']}s limit")
-            if qa.get("size_mb") and qa["size_mb"] > rules["max_mb"]: flags.append(f"{plat}: {qa['size_mb']} MB exceeds {rules['max_mb']} MB")
-            if rules.get("aspect") and qa.get("width") and qa.get("height"):
-                want = rules["aspect"][0] / rules["aspect"][1]; have = qa["width"] / qa["height"]
-                if abs(want - have) > 0.02: flags.append(f"{plat}: aspect {qa['width']}x{qa['height']} is not {rules['aspect'][0]}:{rules['aspect'][1]}")
-            if qa.get("width") and min(qa["width"], qa["height"]) < rules["min_short_side"]: flags.append(f"{plat}: resolution below {rules['min_short_side']}p")
-            if qa.get("vcodec") and qa["vcodec"] not in ("h264", "hevc", "av1", "vp9"): flags.append(f"{plat}: codec {qa['vcodec']} may be rejected (use H.264)")
-        qa["flags"] = flags
-    except Exception as e: qa["error"] = str(e)[-300:]
+        with work(proc_holder, 'probe'):
+            probe = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", path], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=True)
+            j = json.loads(probe.stdout or "{}");
+            if not j.get("streams"): raise RuntimeError("No decodable streams were reported")
+            v = next((x for x in j.get("streams", []) if x["codec_type"] == "video"), {}); a = next((x for x in j.get("streams", []) if x["codec_type"] == "audio"), {})
+            qa.update(width=v.get("width"), height=v.get("height"), vcodec=v.get("codec_name"), acodec=a.get("codec_name"), duration=round(float(j.get("format", {}).get("duration", 0) or 0), 3), size_mb=round(os.path.getsize(path) / 1e6, 2))
+            qa.update(pixel_format=v.get("pix_fmt"), frame_rate=v.get("avg_frame_rate"), declared_frames=v.get("nb_frames"), color_space=v.get("color_space"), color_transfer=v.get("color_transfer"), color_primaries=v.get("color_primaries"), color_range=v.get("color_range"))
+            with open(path, "rb") as exported: qa["sha256"] = hashlib.file_digest(exported, "sha256").hexdigest()
+            if a:
+                r = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-i", path, "-filter_complex", "ebur128=peak=true", "-f", "null", "-"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, check=True).stderr
+                import re as _re; tail = r.split("Summary:")[-1]
+                m = _re.search(r"I:\s+(-?[\d.]+) LUFS", tail); tp = _re.search(r"Peak:\s+(-?[\d.]+) dBFS", tail); lra = _re.search(r"LRA:\s+([\d.]+) LU", tail)
+                if m: qa["integrated_lufs"] = float(m.group(1))
+                if tp: qa["true_peak_dbtp"] = float(tp.group(1))
+                if lra: qa["lra_lu"] = float(lra.group(1))
+            from delivery_color import inspect as inspect_delivery_color
+            qa["delivery_color"] = inspect_delivery_color(v, preset if v or preset is not None else {"format": "audio"})
+            flags = []
+            if qa["delivery_color"]["status"] == "mismatch":
+                flags.append("Delivery color metadata does not match the requested conversion; review delivery_color before use.")
+            elif qa["delivery_color"]["status"] == "legacy_unmanaged":
+                flags.append("Legacy output color tags and display agreement remain unqualified.")
+            if qa.get("integrated_lufs") is not None and not (-16.5 <= qa["integrated_lufs"] <= -12.5): flags.append(f"loudness {qa['integrated_lufs']} LUFS (target -14 ±1.5 for social)")
+            if qa.get("true_peak_dbtp") is not None and qa["true_peak_dbtp"] > -1.0: flags.append(f"true peak {qa['true_peak_dbtp']} dBTP (> -1.0)")
+            plat = (preset or {}).get("platform"); rules = PLATFORM_RULES.get(str(plat).lower()) if plat else None
+            if rules:
+                qa["platform"] = plat
+                if qa.get("duration") and qa["duration"] > rules["max_s"]: flags.append(f"{plat}: {qa['duration']}s exceeds the {rules['max_s']}s limit")
+                if qa.get("size_mb") and qa["size_mb"] > rules["max_mb"]: flags.append(f"{plat}: {qa['size_mb']} MB exceeds {rules['max_mb']} MB")
+                if rules.get("aspect") and qa.get("width") and qa.get("height"):
+                    want = rules["aspect"][0] / rules["aspect"][1]; have = qa["width"] / qa["height"]
+                    if abs(want - have) > 0.02: flags.append(f"{plat}: aspect {qa['width']}x{qa['height']} is not {rules['aspect'][0]}:{rules['aspect'][1]}")
+                if qa.get("width") and min(qa["width"], qa["height"]) < rules["min_short_side"]: flags.append(f"{plat}: resolution below {rules['min_short_side']}p")
+                if qa.get("vcodec") and qa["vcodec"] not in ("h264", "hevc", "av1", "vp9"): flags.append(f"{plat}: codec {qa['vcodec']} may be rejected (use H.264)")
+            qa["flags"] = flags; qa["status"] = "warnings" if flags else "checked"
+            if qa["delivery_color"]["status"] == "mismatch":
+                qa.update(status="error", error="Delivery color metadata failed verification; the encoded file is retained for inspection.")
+            if rules: qa["platform_rules"] = "legacy bundled profile; verify current destination requirements"
+    except Exception as e: qa.update(status="error", error=str(e)[-300:], flags=["Post-render verification failed; review the file before use"])
     return qa
+
 
 def user_fonts():
     """User-installed fonts (data/fonts/*.ttf|otf) → [{family, style, file, url}] using the font's own name table."""
     from PIL import ImageFont
+    from urllib.parse import quote
     d = P("fonts"); out = []
     if not os.path.isdir(d): return out
     for fn in sorted(os.listdir(d)):
         if not fn.lower().endswith((".ttf", ".otf", ".ttc")): continue
         try: fam, sty = ImageFont.truetype(os.path.join(d, fn), 24).getname()
         except Exception: fam, sty = os.path.splitext(fn)[0], "Regular"
-        out.append({"family": fam, "style": sty, "file": fn, "url": f"/fonts/{fn}", "path": os.path.join(d, fn)})
+        out.append({"family": fam, "style": sty, "file": fn, "url": "/fonts/" + quote(fn, safe=""), "path": os.path.join(d, fn)})
     return out
 
 @app.get("/api/fonts")
@@ -556,58 +995,137 @@ def fonts():
 @app.post("/api/fonts/upload")
 async def fonts_upload(file: UploadFile = File(...)):
     """Add your own font (TTF/OTF). It becomes available in every text picker, in the monitor (via @font-face) and in the export."""
-    d = P("fonts"); os.makedirs(d, exist_ok=True); name = os.path.basename(file.filename or "font.ttf")
-    if not name.lower().endswith((".ttf", ".otf", ".ttc")): raise HTTPException(400, "TTF, OTF or TTC only")
-    dest = os.path.join(d, name); open(dest, "wb").write(await file.read())
+    from upload_storage import OwnedUpload, UploadError, FONT_LOCK, font_name
     try:
-        from PIL import ImageFont; fam, sty = ImageFont.truetype(dest, 24).getname()
-    except Exception as e: os.remove(dest); raise HTTPException(400, f"not a usable font: {e}")
+        name = font_name(file.filename)
+        with FONT_LOCK, OwnedUpload(ROOT, "fonts", file.file, ".tmp") as upload:
+            from PIL import ImageFont
+            font = ImageFont.truetype(str(upload.path), 24); fam, sty = font.getname()
+            del font
+            upload.publish_font(name)
+    except (UploadError, OSError, ValueError) as error:
+        raise HTTPException(400, f"not a usable font: {error}") from error
     import render as _r; _r._FONT_MAP.clear()
-    return {"family": fam, "style": sty, "file": name, "url": f"/fonts/{name}"}
+    from urllib.parse import quote
+    return {"family": fam, "style": sty, "file": name, "url": "/fonts/" + quote(name, safe="")}
 
 @app.delete("/api/fonts/{file}")
 def fonts_delete(file: str):
-    f = P("fonts", os.path.basename(file))
-    if os.path.exists(f): os.remove(f)
+    from upload_storage import directory, UploadError, FONT_LOCK, font_name
+    from cache_paths import linked
+    try:
+        with FONT_LOCK:
+            f = directory(ROOT, "fonts") / font_name(file)
+            if linked(f) or f.exists() and not f.is_file(): raise UploadError("Font destination is linked or is not a regular file")
+            if f.exists(): f.unlink()
+    except (UploadError, OSError) as error: raise HTTPException(400, str(error)) from error
     import render as _r; _r._FONT_MAP.clear(); return {"ok": True}
+
+async def _relink_candidate(body):
+    import source_relink_io
+    import source_commands
+    project, expected = _workflow_capture(body)
+    for key in ("actor", "client"):
+        if key in body and (not isinstance(body[key], str) or not body[key].strip() or len(body[key]) > 120):
+            raise HTTPException(422, "Relink actor/client must be a nonempty string of at most 120 characters")
+    try:
+        source_commands.bounded(body)
+        path = body.get("path")
+        if not isinstance(path, str) or not path.strip() or len(path) > 4096 or "\x00" in path:
+            raise ValueError("Replacement path must be a nonempty file path of at most 4096 characters")
+        path = os.path.abspath(path)
+        if not os.path.isfile(path): raise ValueError("Replacement must be an existing file")
+        owner_root, owner_tasks = os.path.abspath(ROOT), TASKS
+        project_file = P("projects", expected["project"], "project.json")
+        candidate = await _owned_render_thread(source_relink_io.inspect, project, body, path, scratch_parent=owner_root)
+        await asyncio.to_thread(source_relink_io.check, path, candidate["stamp"])
+    except (ValueError, KeyError, TypeError, OSError) as error: raise HTTPException(422, str(error)) from error
+    with LOCK: require_project_context({"_context": expected}, active_id(), load_project())
+    planned = candidate["plan"]
+    if body.get("expectedSource") is not None and body["expectedSource"] != planned["expectedSource"]:
+        raise HTTPException(409, "The source changed after inspection; inspect it again")
+    report = {"ok": planned["ok"], "context": expected, "path": path, "info": candidate["info"],
+        **{key:planned[key] for key in ("media_id", "requested_media_id", "affected_media_ids", "issues", "summary", "fingerprint", "expectedSource")}}
+    return {**candidate, "project":project, "expected":expected, "report":report,
+        "owner_root":owner_root, "owner_tasks":owner_tasks, "project_file":project_file}
+
+
+async def _commit_source_relink(candidate, body, envelope):
+    import source_relink_io
+    import source_commands
+    project, expected, planned = candidate["project"], candidate["expected"], candidate["plan"]
+    await asyncio.to_thread(source_relink_io.check, candidate["path"], candidate["stamp"])
+    _source_command_policy(body)
+    result = await _workflow_commit(project, expected, {**envelope, "message":planned["summary"]["message"]}, "relink", body.get("actor", "human"))
+    preparation = {"tasks":[], "warnings":[]}
+    # This request-owned coroutine completes every queue attempt even if its HTTP
+    # reply is lost. A workspace switch must never redirect that registration.
+    for identity in planned["affected_media_ids"]:
+        media = project["media"][identity]
+        if media.get("subclip_of") and not media.get("audio_alias"): continue
+        try:
+            if os.path.abspath(ROOT) != candidate["owner_root"] or TASKS is not candidate["owner_tasks"]:
+                raise ValueError("Workspace changed; open the source workspace and explicitly Prepare its previews")
+            await asyncio.to_thread(source_relink_io.check, candidate["path"], candidate["stamp"])
+            if os.path.abspath(ROOT) != candidate["owner_root"] or TASKS is not candidate["owner_tasks"]:
+                raise ValueError("Workspace changed during source validation; prepare previews from the original workspace")
+            prepared = source_commands.alias_source(project, media) if media.get("audio_alias") else media
+            if not _task_media_current({"media_id":identity, "path":prepared["path"], "token":prepared["ingest_token"],
+                    "project_file":candidate["project_file"], "info":prepared}):
+                raise ValueError("The saved source changed before preparation")
+            queued = finish_ingest(identity, prepared["path"], prepared, candidate["project_file"], prepared["ingest_token"])
+            if queued.get("error"): raise ValueError(queued["error"])
+            preparation["tasks"].append({"media_id":identity, "task":queued})
+        except Exception as error:
+            preparation["warnings"].append("Source "+identity+" saved; preparation could not be queued: "+str(error)[:300])
+    result["preparation"] = preparation
+    result["warnings"] = [*result["warnings"], *preparation["warnings"]]
+    return result
+
 
 @app.post("/api/media/relink")
 async def media_relink(req: Request):
     body = await req.json()
-    with LOCK:
-        proj = load_project(); m = proj["media"].get(body["media_id"])
-        if not m: raise HTTPException(404)
-        if not os.path.exists(body["path"]): raise HTTPException(404, "file not found")
-        mid, nm = await asyncio.to_thread(ingest, body["path"], m.get("name")); nm["id"] = m["id"]; proj["media"][m["id"]] = nm; save_project(proj)
-    ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": [m["id"]], "relink": body["path"]}); await broadcast(ev); return nm
+    if not isinstance(body, dict) or not isinstance(body.get("fingerprint"), str) or len(body["fingerprint"]) != 64 or any(c not in "0123456789abcdef" for c in body["fingerprint"]):
+        raise HTTPException(400, "Relink requires the exact reviewed fingerprint and saved context; inspect the replacement first")
+    _source_command_policy(body)
+    candidate = await _relink_candidate(body); planned = candidate["plan"]
+    if body["fingerprint"] != planned["fingerprint"]: raise HTTPException(409, "The reviewed Relink plan changed; inspect the replacement again")
+    if not planned["ok"]: raise HTTPException(422, candidate["report"])
+    summary = planned["summary"]
+    envelope = {"project":candidate["expected"]["project"], "changed":bool(planned["ops"]), "summary":summary,
+        "warnings":summary.get("warnings", []), "media_id":planned["media_id"], "requested_media_id":planned["requested_media_id"],
+        "affected_media_ids":planned["affected_media_ids"], "media":planned["media"].get(planned["media_id"], candidate["project"]["media"][planned["media_id"]])}
+    _source_command_policy(body)
+    if not planned["ops"]:
+        with LOCK: require_project_context({"_context":candidate["expected"]}, active_id(), load_project())
+        return {"ok":True, **envelope, "context":candidate["expected"], "preparation":{"tasks":[],"warnings":[]}}
+    try:
+        apply_ops(candidate["project"], planned["ops"])
+        parse_project(json.dumps(candidate["project"], allow_nan=False).encode("utf-8"))
+    except (ValueError, KeyError, TypeError) as error: raise HTTPException(422, str(error)) from error
+    commit = asyncio.create_task(_commit_source_relink(candidate, body, envelope))
+    try: return await asyncio.shield(commit)
+    except asyncio.CancelledError:
+        while not commit.done():
+            try: await asyncio.shield(commit)
+            except asyncio.CancelledError: continue
+            except Exception: break
+        if not commit.cancelled(): commit.exception()
+        raise
+
+
+@app.post("/api/media/relink/inspect")
+async def media_relink_inspect(req: Request):
+    return (await _relink_candidate(await req.json()))["report"]
 
 @app.get("/api/media/status")
 def media_status():
-    proj = load_project(); return {mid: os.path.exists(m["path"]) for mid, m in proj["media"].items()}
+    proj = load_project(); return {mid: media_online(proj["media"].get(m.get("subclip_of"), m)) for mid, m in proj["media"].items()}
 
 @app.post("/api/captions/auto")
 async def captions_auto(req: Request):
-    """Transcribe the sequence's audio to captions with faster-whisper or openai-whisper if installed on the workstation."""
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); model = body.get("model", "base")
-    proj = load_project(); os.makedirs(P("renders"), exist_ok=True); wav = P("renders", f"_auto_{seq_id}.wav")
-    cmd, graph = build_command(proj, seq_id, wav, {"format": "audio", "acodec": "wav"})
-    r = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
-    if r.returncode != 0: raise HTTPException(500, r.stderr[-800:])
-    caps = []
-    try:
-        from faster_whisper import WhisperModel
-        segs, _ = WhisperModel(model, compute_type="int8").transcribe(wav, vad_filter=True)
-        caps = [{"id": str(uuid.uuid4())[:8], "start": float(sg.start), "end": float(sg.end), "text": sg.text.strip()} for sg in segs]
-    except ImportError:
-        try:
-            import whisper
-            res = whisper.load_model(model).transcribe(wav)
-            caps = [{"id": str(uuid.uuid4())[:8], "start": float(sg["start"]), "end": float(sg["end"]), "text": sg["text"].strip()} for sg in res["segments"]]
-        except ImportError:
-            return JSONResponse({"error": "No transcriber installed. Run the installer with --with-whisper (or pip install faster-whisper in Filmocity/.venv), then retry."}, status_code=501)
-    with LOCK:
-        proj = load_project(); seq = next(s for s in proj["sequences"] if s["id"] == seq_id); seq["captions"] = caps; save_project(proj)
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "captions_auto", "reason": f"{len(caps)} captions", "ops": []}); await broadcast(ev); return {"count": len(caps)}
+    return await _workflow_transcription(await req.json(), words=False)
 
 # ---------- bundled assets: LUTs, graphics templates, presets ----------
 @app.get("/api/luts")
@@ -628,7 +1146,10 @@ def media_by_path(p: str):
 def lut_file(path: str):
     from fastapi.responses import PlainTextResponse
     ap = os.path.abspath(path); allowed = [os.path.abspath(os.path.join(ASSETS, "luts")), os.path.abspath(os.path.join(ASSETS, "luts", "input")), os.path.abspath(P("luts"))]
-    if not any(ap.startswith(a + os.sep) for a in allowed) or not ap.lower().endswith(".cube") or not os.path.exists(ap): raise HTTPException(404)
+    from project_resources import references
+    with LOCK:
+        referenced = any(os.path.abspath(obj[key]) == ap for obj, key, _, _ in references(load_project()) if key == "lut" or key == "path" and obj.get("name") in ("slog3", "vlog", "clog3", "logc3"))
+    if not (referenced or any(ap.startswith(a + os.sep) for a in allowed)) or not ap.lower().endswith(".cube") or not os.path.isfile(ap): raise HTTPException(404)
     return PlainTextResponse(open(ap, encoding="utf-8", errors="ignore").read())
 
 @app.get("/api/templates/preview")
@@ -679,139 +1200,989 @@ def templates():
 def presets(kind: str):
     f = os.path.join(ASSETS, "presets", f"{kind}.json"); return json.load(open(f)) if os.path.exists(f) else {}
 
-@app.post("/api/undo")
-async def undo(req: Request):
-    """Project-wide undo: reverts the most recent op group by anyone (human or agent). Survives reloads; agent ops are undoable too."""
+async def project_history_action(direction, req):
     body = await req.json() if req.headers.get("content-length") not in (None, "0") else {}
     with LOCK:
-        st = json.load(open(undo_stack_path())) if os.path.exists(undo_stack_path()) else {"undo": [], "redo": []}
-        if not st["undo"]: return {"ok": False, "reason": "nothing to undo"}
-        entry = st["undo"].pop(); proj = load_project()
-        try: inv = inverse_ops(entry["ops"], entry["befores"], proj); befores = apply_ops(proj, inv)
-        except Exception as e: json.dump(st, open(undo_stack_path(), "w")); return JSONResponse({"ok": False, "reason": f"could not invert: {e}"}, status_code=409)
-        st["redo"].append(entry); st["redo"] = st["redo"][-200:]; json.dump(st, open(undo_stack_path(), "w")); save_project(proj)
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "undo", "reason": f"undo: {entry.get('reason') or ''} ({entry.get('actor')})", "ops": inv, "befores": befores, "client": body.get("client")}); await broadcast({k: v for k, v in ev.items() if k != "befores"}); return {"ok": True, "undone": entry.get("reason"), "by": entry.get("actor"), "remaining": len(st["undo"])}
+        pid = active_id(); before = load_project(); require_project_context(body, pid, before)
+        history = read_undo_history(pid)
+        if not history[direction]: return {"ok": False, "reason": "nothing to " + direction}
+        entry = history[direction][-1]
+        try:
+            if "changes" in entry:
+                proj = apply_changes(before, entry["changes"], direction)
+            else:
+                # Existing projects keep their operation-based history. New
+                # entries use exact values so removed fields and normalization
+                # also round-trip. A failed legacy inversion retains its entry.
+                proj = copy.deepcopy(before)
+                ops = inverse_ops(entry["ops"], entry["befores"], proj) if direction == "undo" else copy.deepcopy(entry["ops"])
+                befores = apply_ops(proj, ops)
+                if direction == "redo":
+                    if not (ops and all(o.get("op") == "set_mix" for o in ops)): normalize_tracks(proj)
+                    entry["befores"] = befores
+                entry["changes"] = changes_between(proj, before) if direction == "undo" else changes_between(before, proj)
+            parse_project(json.dumps(proj, allow_nan=False).encode("utf-8"))
+        except (HistoryConflict, RecoveryError, ValueError, TypeError, KeyError, IndexError, StopIteration) as error:
+            raise HTTPException(409, {"code": "history_conflict", "message": "Cannot " + direction + " this edit: " + str(error)[:300]}) from error
+        history[direction].pop()
+        other = "redo" if direction == "undo" else "undo"
+        history[other] = (history[other] + [entry])[-200:]
+        warning = commit_project_history(proj, history, pid)
+        context = project_context(ROOT, pid, proj)
+        ev = {"type": "project_replaced", "project": pid, "source": direction, "actor": body.get("actor", "human"),
+              "reason": entry.get("reason"), "client": body.get("client"), "context": context}
+        try: log_event(ev, project_id=pid)
+        except OSError as error: warning = (warning + "; " if warning else "") + "Event history could not be recorded: " + str(error)[:200]
+    await broadcast(ev)
+    return {"ok": True, "undone" if direction == "undo" else "redone": entry.get("reason"), "by": entry.get("actor"),
+            "remaining": len(history[direction]), "context": context, "warning": warning}
+
+
+@app.post("/api/undo")
+async def undo(req: Request):
+    return await project_history_action("undo", req)
+
 
 @app.post("/api/redo")
 async def redo(req: Request):
-    body = await req.json() if req.headers.get("content-length") not in (None, "0") else {}
-    with LOCK:
-        st = json.load(open(undo_stack_path())) if os.path.exists(undo_stack_path()) else {"undo": [], "redo": []}
-        if not st["redo"]: return {"ok": False, "reason": "nothing to redo"}
-        entry = st["redo"].pop(); proj = load_project(); befores = apply_ops(proj, copy.deepcopy(entry["ops"])); normalize_tracks(proj); entry["befores"] = befores; st["undo"].append(entry); json.dump(st, open(undo_stack_path(), "w")); save_project(proj)
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "redo", "reason": f"redo: {entry.get('reason') or ''}", "ops": entry["ops"], "befores": befores, "client": body.get("client")}); await broadcast({k: v for k, v in ev.items() if k != "befores"}); return {"ok": True, "redone": entry.get("reason")}
+    return await project_history_action("redo", req)
+
 
 @app.get("/api/undo/stack")
 def undo_stack():
-    st = json.load(open(undo_stack_path())) if os.path.exists(undo_stack_path()) else {"undo": [], "redo": []}
-    return {"undo": [{"reason": e.get("reason"), "actor": e.get("actor"), "ts": e.get("ts"), "n": len(e.get("ops", []))} for e in st["undo"][-50:]], "redo": [{"reason": e.get("reason"), "actor": e.get("actor")} for e in st["redo"][-50:]]}
+    with LOCK:
+        load_project(); st = read_undo_history(active_id())
+        return {"undo": [{"reason": e.get("reason"), "actor": e.get("actor"), "ts": e.get("ts"), "n": len(e.get("ops", []))} for e in st["undo"][-50:]], "redo": [{"reason": e.get("reason"), "actor": e.get("actor")} for e in st["redo"][-50:]]}
 
 @app.get("/api/version")
-def version(): return {"version": VERSION, "schema": SCHEMA}
+def version(): return {"app": "Filmocity", "version": VERSION, "schema": SCHEMA, "instance": INSTANCE_ID, "pid": os.getpid(), "workspace": workspace_id(ROOT), "build": BUILD_INFO}
 
 # ---------- effects catalog + stabilization analysis ----------
 @app.get("/api/effects")
 def effects_list(): return effects_catalog()
 
+async def _stabilization_candidate(body):
+    import stabilization
+    project, expected = _workflow_capture(body)
+    try: review = await _owned_render_thread(stabilization.inspect, project, expected, body)
+    except stabilization.StaleAnalysis as error: raise HTTPException(409, str(error)) from error
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(422, str(error)) from error
+    with LOCK: require_project_context({"_context": expected}, active_id(), load_project())
+    return project, expected, review
+
+
+@app.post("/api/stabilize/inspect")
+async def stabilization_inspect(req: Request):
+    """Read only: review the saved project, physical source bytes and settings."""
+    return (await _stabilization_candidate(await req.json()))[2]
+
+
 @app.post("/api/stabilize")
 async def stabilize(req: Request):
-    """Warp Stabilizer analysis pass (vidstabdetect) for a media file → data_root/stab/<id>.trf, stored on the media entry."""
-    body = await req.json(); proj = load_project(); m = proj["media"].get(body["media_id"])
-    if not m or not m.get("has_video"): raise HTTPException(404)
-    src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m
-    os.makedirs(P("stab"), exist_ok=True); trf = P("stab", f"{src['id']}.trf")
-    if not os.path.exists(trf) or body.get("force"):
-        r = await asyncio.to_thread(subprocess.run, ["ffmpeg", "-hide_banner", "-nostats", "-y", "-i", src["path"], "-vf", f"vidstabdetect=shakiness={int(body.get('shakiness', 5))}:accuracy=15:result='{trf.replace(chr(92), '/').replace(':', chr(92) + ':')}'", "-f", "null", "-"], capture_output=True, text=True, timeout=3600)
-        if r.returncode != 0 or not os.path.exists(trf): raise HTTPException(500, "vidstab analysis failed — this FFmpeg build may lack libvidstab. " + r.stderr[-300:])
-    with LOCK:
-        proj = load_project()
-        for mid, mm in proj["media"].items():
-            if mid == src["id"] or mm.get("subclip_of") == src["id"]: mm["stab_trf"] = trf
-        save_project(proj)
-    ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": [src["id"]], "stabilized": True}); await broadcast(ev); return {"trf": trf}
+    """Analyze exactly a reviewed input, then publish and save to its owner."""
+    import stabilization
+    body = await req.json()
+    if (not isinstance(body, dict) or not isinstance(body.get("fingerprint"), str)
+            or len(body["fingerprint"]) != 64 or any(c not in "0123456789abcdef" for c in body["fingerprint"])):
+        raise HTTPException(400, "Stabilization requires the reviewed fingerprint and saved project context; inspect first")
+    _source_command_policy(body)
+    project, expected, review = await _stabilization_candidate(body)
+    if body["fingerprint"] != review["fingerprint"]:
+        raise HTTPException(409, "The reviewed stabilization input changed; inspect it again")
+    root, holder = ROOT, {}
+    try:
+        prepared = await _owned_render_thread(stabilization.prepare, root, project, review, proc_holder=holder)
+        async def commit():
+            _source_command_policy(body)
+            with LOCK:
+                pid = active_id(); before = load_project()
+                require_project_context({"_context": expected}, pid, before)
+                try: stabilization.check_source(review)
+                except (ValueError, OSError) as error: raise HTTPException(409, str(error)) from error
+                result = prepared.publish()
+                after = copy.deepcopy(before)
+                affected = review["affected_media_ids"]
+                for mid in affected:
+                    after["media"][mid]["stab_trf"] = result["trf"]
+                    after["media"][mid]["stab_analysis"] = copy.deepcopy(result["record"])
+                changed = after != before
+                warning = ""
+                if changed:
+                    parse_project(json.dumps(after, allow_nan=False).encode("utf-8"))
+                    warning = commit_edit(before, after, pid, {"actor": body.get("actor", "human"),
+                        "tool": "workflow_stabilize", "reason": "Analyze source motion", "ts": time.time()}) or ""
+                context = project_context(root, pid, after)
+                event = {"type": "ops", "project": pid, "tool": "workflow_stabilize",
+                    "actor": body.get("actor", "human"), "ops": [], "context": context}
+                if changed:
+                    try: log_event(event, project_id=pid)
+                    except OSError as error: warning += " Event history unavailable: " + str(error)[:200]
+            if changed:
+                try: await broadcast(event)
+                except Exception: warning += " Saved; another editor may need to refresh"
+            return {"ok": True, "kind": "stabilization", "context": context,
+                "requested_media_id": review["requested_media_id"], "media_id": review["media_id"],
+                "media": affected, "trf": result["trf"], "analysis": result["record"],
+                "cached": result["cached"], "changed": changed, "warning": warning.strip()}
+        task = asyncio.create_task(commit())
+        try: return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try: await asyncio.shield(task)
+                except asyncio.CancelledError: continue
+                except Exception: break
+            if not task.cancelled(): task.exception()
+            raise
+    except stabilization.StaleAnalysis as error: raise HTTPException(409, str(error)) from error
+    except (ValueError, TypeError, KeyError, OSError) as error:
+        prepared = holder.get("prepared_analysis")
+        suffix = (" Published analysis retained at " + prepared.result["trf"]
+            + "; inspect saved state/Recovery before retrying.") if prepared and prepared.published else ""
+        raise HTTPException(422 if not suffix else 500, str(error) + suffix) from error
+    finally:
+        prepared = holder.get("prepared_analysis")
+        if prepared: prepared.close()
 
 # ---------- projects ----------
 @app.get("/api/projects")
 def projects_list():
-    out = []
-    for pid in sorted(os.listdir(P("projects"))) if os.path.isdir(P("projects")) else []:
-        pj = P("projects", pid, "project.json")
-        if os.path.exists(pj):
-            try: j = json.load(open(pj)); out.append({"id": pid, "name": j.get("name", pid), "updated": j.get("updated"), "sequences": len(j.get("sequences", [])), "media": len(j.get("media", {})), "active": pid == active_id()})
-            except Exception: pass
-    return out
+    from project_lifecycle import catalog
+    with LOCK: root, pid = ROOT, active_id()
+    return catalog(root, pid)
 
-async def _switch(pid, actor):
-    json.dump({"id": pid}, open(P("active.json"), "w")); proj = load_project()
-    ev = log_event({"type": "project_replaced", "actor": actor, "source": "open_project", "project": pid}); await broadcast(ev); return proj
+def _read_project_target(pid, target_sha=None):
+    from project_lifecycle import project_file, read, ProjectActionError
+    try:
+        path = project_file(ROOT, pid)
+        raw = read(path)
+        if target_sha is not None and target_sha != hashlib.sha256(raw).hexdigest():
+            raise HTTPException(409, "The selected project changed. Refresh the project list before opening it.")
+        recover_transaction(path)
+        doc = parse_project(read(path))
+        if doc.get("version", 1) < SCHEMA:
+            doc = migrate_project(doc); save_project(doc, str(path))
+        read_undo_history(pid)
+        return doc
+    except (OSError, RecoveryError, TransactionRecoveryRequired, ProjectActionError) as error:
+        raise HTTPException(422, {"code": "project_target_unavailable", "message": "This project needs attention; the active project was kept. Open its Recovery versions. " + str(error)[:350]}) from error
+
+def _activate_project_locked(pid, actor, expected=None, target_sha=None, source="open_project"):
+    # Validate before touching active.json, under the same lock as guarded edits.
+    if expected is not None:
+        origin = active_id(); require_project_context({"_context": expected}, origin, load_project())
+    doc = _read_project_target(pid, target_sha)
+    set_active_project(pid)
+    result = {"ok": True, "id": pid, "name": doc.get("name", pid), "context": project_context(ROOT, pid, doc)}
+    event = {"type": "project_replaced", "actor": actor, "source": source, "project": pid, "context": result["context"]}
+    try: log_event(event, project_id=pid)
+    except Exception as error: result["warning"] = "Project opened; event history could not be saved: " + str(error)[:300]
+    return result, event
+
+async def _project_action_notify(result, event):
+    try: await broadcast(event)
+    except Exception as error: result["warning"] = (result.get("warning", "") + "; Project opened; other editors may need to refresh: " + str(error)[:200]).lstrip('; ')
+    return result
+
+async def _switch(pid, actor, expected=None, target_sha=None):
+    with LOCK: result, event = _activate_project_locked(pid, actor, expected, target_sha)
+    return await _project_action_notify(result, event)
+
+def set_active_project(pid):
+    # Caller holds LOCK, shared with guarded edits. Never expose partial JSON
+    # to active_id(), whose compatibility fallback is the default project.
+    temporary = P("active.json.tmp")
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump({"id": pid}, stream); stream.flush(); os.fsync(stream.fileno())
+    for attempt in range(6):
+        try:
+            os.replace(temporary, P("active.json")); break
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (5, 32, 33) or attempt == 5: raise
+            time.sleep(min(0.02 * 2 ** attempt, 0.2))
+
+def _prepare_project_action(body, kind):
+    from project_lifecycle import project_name, ProjectActionError
+    project, expected = _workflow_capture(body)
+    try:
+        fallback = "Untitled" if kind == "new" else (project.get("name", "Untitled") + " copy")
+        name = project_name(body.get("name"), fallback)
+        if "copy_media" in body and type(body["copy_media"]) is not bool: raise ProjectActionError("Copy media must be true or false")
+    except ProjectActionError as error: raise HTTPException(400, str(error)) from error
+    pid = "project-" + uuid.uuid4().hex
+    document = default_project() if kind == "new" else copy.deepcopy(project)
+    document["name"] = name; document["updated"] = time.time()
+    if kind == "new" and body.get("copy_media"): document["media"] = copy.deepcopy(project["media"])
+    if kind == "duplicate": document["id"] = pid; document["proposals"] = []
+    return document, expected, pid
+
+def _commit_prepared_project(document, expected, pid, actor, kind, check=lambda: None):
+    from project_lifecycle import PreparedProject, project_file
+    source = project_file(ROOT, expected["project"]).parent if kind == "save_as" else None
+    prepared = PreparedProject(ROOT, document, pid, source=source, check=check)
+    try:
+        with LOCK:
+            require_project_context({"_context": expected}, active_id(), load_project())
+            prepared.publish()
+            try: return _activate_project_locked(pid, actor, expected, source=kind)
+            except Exception as error:
+                raise HTTPException(409, f"The new project was saved at {prepared.path}, but opening it was not confirmed. Refresh the project list before creating another copy. {str(error)[:200]}") from error
+    finally: prepared.close()
 
 @app.post("/api/projects/new")
 async def projects_new(req: Request):
-    body = await req.json(); name = body.get("name") or "Untitled"; pid = "".join(ch for ch in name.lower().replace(" ", "_") if ch.isalnum() or ch in "_-")[:32] or "project"; pid = pid + "_" + str(uuid.uuid4())[:4]
-    os.makedirs(P("projects", pid), exist_ok=True); proj = default_project(); proj["name"] = name
-    if body.get("copy_media"): proj["media"] = load_project().get("media", {})
-    json.dump(proj, open(P("projects", pid, "project.json"), "w"), indent=1); await _switch(pid, body.get("actor", "human")); return {"id": pid, "name": name}
+    body = await req.json(); document, expected, pid = _prepare_project_action(body, "new")
+    result, event = _commit_prepared_project(document, expected, pid, body.get("actor", "human"), "new")
+    return await _project_action_notify(result, event)
 
 @app.post("/api/projects/open")
 async def projects_open(req: Request):
-    body = await req.json(); pid = os.path.basename(body["id"])
-    if not os.path.exists(P("projects", pid, "project.json")): raise HTTPException(404)
-    await _switch(pid, body.get("actor", "human")); return {"id": pid}
+    body = await req.json()
+    if isinstance(body, dict) and "_recovery_origin" in body:
+        with LOCK:
+            receipt = body["_recovery_origin"]; pid = active_id(); report = inspect_recovery(P("projects", pid, "project.json"))
+            if (not isinstance(receipt, dict) or receipt.get("workspace") != workspace_id(ROOT) or receipt.get("project") != pid
+                    or receipt.get("current_sha256") != report["current_sha256"] or report["current_valid"]):
+                raise HTTPException(409, "Recovery project changed. Refresh before opening another project.")
+            result, event = _activate_project_locked(body.get("id"), body.get("actor", "human"), target_sha=body.get("_target_sha256"))
+        return await _project_action_notify(result, event)
+    _, expected = _workflow_capture(body)
+    return await _switch(body.get("id"), body.get("actor", "human"), expected, body.get("_target_sha256"))
 
 @app.post("/api/projects/save_as")
 async def projects_save_as(req: Request):
-    body = await req.json(); name = body.get("name") or "Copy"; pid = "".join(ch for ch in name.lower().replace(" ", "_") if ch.isalnum() or ch in "_-")[:32] + "_" + str(uuid.uuid4())[:4]
-    src = P("projects", active_id()); dst = P("projects", pid); shutil.copytree(src, dst, ignore=shutil.ignore_patterns("*.tmp")); j = json.load(open(os.path.join(dst, "project.json"))); j["name"] = name; json.dump(j, open(os.path.join(dst, "project.json"), "w"), indent=1)
-    await _switch(pid, body.get("actor", "human")); return {"id": pid, "name": name}
+    from project_lifecycle import COPY_WORKER, ProjectActionError
+    body = await req.json(); document, expected, pid = _prepare_project_action(body, "save_as")
+    try:
+        result, event = await COPY_WORKER.run(lambda check: _commit_prepared_project(document, expected, pid, body.get("actor", "human"), "save_as", check))
+    except ProjectActionError as error: raise HTTPException(409, str(error)) from error
+    except (OSError, MediaCollectionError) as error: raise HTTPException(422, "Project copy failed; the original was kept. " + str(error)[:400]) from error
+    return await _project_action_notify(result, event)
+
+def _task_collect(payload, task):
+    from collection_workflow import prepare
+    return prepare(payload, task)
 
 @app.post("/api/projects/collect")
+@app.post("/api/tasks/collect")
 async def projects_collect(req: Request):
-    """Project Manager: copy every media file into data_root/collected/<project>/ and relink."""
-    body = await req.json(); pid = active_id(); dest = P("collected", pid); os.makedirs(dest, exist_ok=True); copied = 0
+    """Queue verified originals; only a later explicit Apply changes project paths."""
+    from collection_workflow import payload
+    from project_lifecycle import COPY_WORKER, ProjectActionError
+    if TASKS is None: raise HTTPException(503, "Background tasks are unavailable")
+    body = await req.json(); project, expected = _workflow_capture(body)
+    root = ROOT
+    try:
+        captured = await COPY_WORKER.run(lambda check: payload(project, root, expected["project"], check=check))
+        with LOCK:
+            require_project_context({"_context": expected}, active_id(), load_project())
+            task = TASKS.submit("collect", project.get("name", "Project"), expected, captured, identity=body.get("request_id"))
+    except (TaskError, ProjectActionError) as error: raise HTTPException(409, str(error)) from error
+    except (MediaCollectionError, OSError, ValueError) as error: raise HTTPException(422, str(error)) from error
+    return {"ok": True, "task": task, "context": expected,
+            "message": "Collection queued. Keep editing; apply the verified copies from Tasks when ready."}
+
+def _commit_collection(identity, value, project, expected, actor, check):
+    from collection_workflow import verify
+    try: after = verify(project, value["payload"], value["result"], check)
+    except (MediaCollectionError, OSError, ValueError) as error: raise HTTPException(422, str(error)) from error
+    after.setdefault("workflow", {})["collection_task"] = identity
     with LOCK:
-        proj = load_project()
-        for m in proj["media"].values():
-            if m.get("subclip_of") or not os.path.exists(m["path"]): continue
-            target = os.path.join(dest, os.path.basename(m["path"]))
-            if os.path.abspath(target) != os.path.abspath(m["path"]):
-                if not os.path.exists(target): shutil.copy2(m["path"], target); copied += 1
-                m["path"] = os.path.abspath(target)
-        save_project(proj)
-    ev = log_event({"type": "project_replaced", "actor": body.get("actor", "human"), "source": "collect", "copied": copied}); await broadcast(ev); return {"dest": dest, "copied": copied}
+        check(); pid = active_id(); before = load_project()
+        require_project_context({"_context": expected}, pid, before)
+        warning = commit_edit(before, after, pid, {"actor": actor, "tool": "collect", "reason": "Relink to verified collected originals", "ts": time.time()})
+        context = project_context(ROOT, pid, after)
+        result = {"ok": True, "context": context, "message": "Collected originals applied. Undo restores the previous media paths; copies are retained.", "warning": warning or ""}
+        event = {"type": "project_replaced", "source": "collect", "actor": actor, "project": pid, "context": context}
+        try: log_event(event, project_id=pid)
+        except Exception as error: result["warning"] += ("; " if result["warning"] else "") + "Relink saved; event history unavailable: " + str(error)[:200]
+    return result, event
+
+async def _apply_collection(identity, value, body, project, expected):
+    from project_lifecycle import COPY_WORKER, ProjectActionError
+    if value["record"]["context"]["project"] != expected["project"]: raise HTTPException(409, "Open the original project first")
+    if project.get("workflow", {}).get("collection_task") == identity:
+        TASKS.finish_apply(identity, success=True, message="Collection already applied")
+        return {"ok": True, "context": expected, "message": "Collection already applied; no action repeated"}
+    try: claimed = TASKS.begin_apply(identity)
+    except (TaskError, OSError) as error: raise HTTPException(409, str(error)) from error
+    try:
+        result, event = await COPY_WORKER.run(lambda check: _commit_collection(identity, claimed, project, expected, body.get("actor", "human"), check))
+    except BaseException as error:
+        TASKS.finish_apply(identity, success=False, message="Relink was not confirmed. Inspect the project before applying again; verified copies were retained.")
+        if isinstance(error, ProjectActionError): raise HTTPException(409, str(error)) from error
+        if isinstance(error, (MediaCollectionError, ValueError)): raise HTTPException(422, str(error)) from error
+        raise
+    task = TASKS.finish_apply(identity, success=True, message="Collection applied")
+    if task.get("warning"): result["warning"] = (result.get("warning", "") + "; " + task["warning"]).strip("; ")
+    return await _project_action_notify(result, event)
 
 @app.post("/api/media/scenes")
 async def media_scenes(req: Request):
-    """Scene edit detection: cut points of a media file (FFmpeg scene score). {media_id, threshold, in, out}"""
-    body = await req.json(); proj = load_project(); m = proj["media"].get(body["media_id"])
-    if not m or not m.get("has_video"): raise HTTPException(404)
-    src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m; off = float(m.get("sub_in", 0) or 0)
-    i, o = float(body.get("in", 0)) + off, float(body.get("out", m["duration"])) + off; th = float(body.get("threshold", 0.35))
-    r = (await asyncio.to_thread(subprocess.run, ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{i:.3f}", "-t", f"{max(o - i, 0.1):.3f}", "-i", src["path"], "-vf", f"scale=320:-2,select='gt(scene,{th})',showinfo", "-an", "-f", "null", "-"], capture_output=True, text=True, timeout=900)).stderr
-    import re as _re; times = sorted({round(float(t), 3) for t in _re.findall(r"pts_time:([\d.]+)", r)})
-    return {"cuts": [t for t in times if 0.2 < t < (o - i) - 0.2], "threshold": th}
+    return _queue_media_analysis(await req.json(), "scenes")
+
+def _queue_media_analysis(body, mode):
+    import media_analysis
+    if TASKS is None: raise HTTPException(503, "Background tasks are unavailable")
+    project, expected = _workflow_capture(body)
+    try:
+        payload = media_analysis.capture(project, body, mode, expected)
+        task = TASKS.submit("analysis", project["media"][payload["media_id"]].get("name", "Source") + {"scenes": " — scene detection", "silences": " — silence detection", "remix": " — music remix"}[mode],
+                            expected, payload, identity=body.get("request_id"))
+    except (ValueError, KeyError, OSError, TypeError) as error: raise HTTPException(400, str(error)) from error
+    return {"ok": True, "task": task, "context": expected, "message": "Analysis queued. Review the result in Tasks before applying edits."}
+
+def _task_media_analysis(payload, task):
+    import media_analysis
+    return media_analysis.analyze(payload, task)
+
+def _review_media_analysis(value, project, expected):
+    import media_analysis
+    if value["record"]["kind"] != "analysis" or value["record"]["status"] != "ready" or value.get("result") is None:
+        raise HTTPException(409, "This analysis result is not ready for review")
+    try:
+        media_analysis.validate_current(project, value["payload"], expected)
+        result = {"ok": True, "task": value["record"], "context": expected, "result": value["result"]}
+        if value["payload"].get("clip_id") is not None:
+            import analysis_edits
+            result["plan"] = analysis_edits.plan(project, value["payload"], value["result"], identity=value["record"]["id"])
+        return result
+    except (ValueError, KeyError, OSError, TypeError) as error: raise HTTPException(409, str(error)) from error
+
+@app.post("/api/tasks/{identity}/analysis")
+async def background_analysis_review(identity: str, req: Request):
+    value = _owned_task(identity); project, expected = _workflow_capture(await req.json())
+    return _review_media_analysis(value, project, expected)
+
+async def _apply_media_analysis(identity, value, body, project, expected):
+    payload = value["payload"]
+    if not payload.get("clip_id"): raise HTTPException(409, "Raw media analysis has no timeline edit to apply")
+    sequence = next((seq for seq in project.get("sequences", []) if seq.get("id") == payload["sequence"]), None)
+    if sequence is not None and sequence.get("workflow", {}).get("analysis_task") == identity:
+        TASKS.finish_apply(identity, success=True, message="Analysis edit already applied")
+        return {"ok": True, "context": expected, "message": "Analysis edit already applied; no edit repeated"}
+    if body.get("actor", "human") != "human":
+        try:
+            with open(P("settings.json"), encoding="utf-8") as stream: mode = json.load(stream).get("agent_mode") or "direct"
+        except FileNotFoundError: mode = "direct"
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            raise HTTPException(403, "Could not read agent editing preferences; repair settings before direct analysis edits") from error
+        if mode == "proposals_only": raise HTTPException(403, "Direct agent edits are disabled. Submit the reviewed analysis ops as a proposal for the editor to accept.")
+    reviewed = _review_media_analysis(value, project, expected); plan = reviewed["plan"]
+    if not isinstance(body.get("fingerprint"), str) or body["fingerprint"] != plan["fingerprint"]:
+        raise HTTPException(409, "The analysis edit plan changed. Review it again before applying")
+    try: TASKS.begin_apply(identity)
+    except (TaskError, OSError) as error: raise HTTPException(409, str(error)) from error
+    try:
+        apply_ops(project, plan["ops"])
+        if normalize_tracks(project): raise ValueError("The analysis plan contains unresolved overlaps; review the timeline")
+        sequence = next(seq for seq in project["sequences"] if seq["id"] == payload["sequence"])
+        sequence.setdefault("workflow", {})["analysis_task"] = identity
+        result = await _workflow_commit(project, expected, plan["summary"], "analysis_" + payload["mode"], body.get("actor", "human"))
+    except BaseException:
+        TASKS.finish_apply(identity, success=False, message="Analysis apply was not confirmed. Check the project before retrying.")
+        raise
+    task = TASKS.finish_apply(identity, success=True, message="Analysis edit applied")
+    if task.get("warning"): result["warning"] = (result.get("warning", "") + "; " + task["warning"]).strip("; ")
+    return result
 
 @app.post("/api/transcript")
 async def transcript(req: Request):
-    """Word-level transcript of the sequence audio (faster-whisper with word timestamps) → sequence.transcript = [{w, s, e, p}] and captions."""
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); model = body.get("model", "base")
-    proj = load_project(); os.makedirs(P("renders"), exist_ok=True); wav = P("renders", f"_tr_{seq_id}.wav")
-    cmd, graph = build_command(proj, seq_id, wav, {"format": "audio", "acodec": "wav"})
-    r = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True)
-    if r.returncode != 0: raise HTTPException(500, r.stderr[-800:])
-    words, caps = [], []
-    try:
-        from faster_whisper import WhisperModel
-        segs, _ = WhisperModel(model, compute_type="int8").transcribe(wav, vad_filter=True, word_timestamps=True)
-        for sg in segs:
-            caps.append({"id": str(uuid.uuid4())[:8], "start": float(sg.start), "end": float(sg.end), "text": sg.text.strip()})
-            for w in (sg.words or []): words.append({"w": w.word.strip(), "s": float(w.start), "e": float(w.end), "p": float(getattr(w, "probability", 1.0))})
-    except ImportError:
-        return JSONResponse({"error": "faster-whisper is not installed. Run the installer with --with-whisper (or pip install faster-whisper in Filmocity/.venv)."}, status_code=501)
+    return await _workflow_transcription(await req.json(), words=True)
+
+# ---------- guided editing workflow ----------
+def _workflow_capture(body, *, required=True):
+    if not isinstance(body, dict) or (required and "_context" not in body):
+        raise HTTPException(400, "Workflow actions require the saved project context")
     with LOCK:
-        proj = load_project(); seq = next(x for x in proj["sequences"] if x["id"] == seq_id); seq["transcript"] = words
-        if body.get("captions", True): seq["captions"] = caps
-        save_project(proj)
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "transcript", "reason": f"{len(words)} words", "ops": []}); await broadcast(ev); return {"words": len(words), "captions": len(caps)}
+        pid = active_id(); proj = load_project()
+        require_project_context(body, pid, proj)
+        return copy.deepcopy(proj), project_context(ROOT, pid, proj)
+
+async def _workflow_commit(after, expected, summary, action, actor="human"):
+    with LOCK:
+        pid = active_id(); before = load_project()
+        require_project_context({"_context": expected}, pid, before)
+        warning = commit_edit(before, after, pid, {"actor": actor, "tool": "workflow_" + action,
+            "reason": summary.get("message", action), "ts": time.time()})
+        context = project_context(ROOT, pid, after)
+        event = {"type": "ops", "project": pid, "tool": "workflow_" + action, "actor": actor, "ops": [], "context": context}
+        notices = [warning] if warning else []
+        try: log_event(event, project_id=pid)
+        except OSError as error: notices.append("Event history unavailable: " + str(error)[:200])
+    try: await broadcast(event)
+    except Exception: notices.append("Saved; another editor may need to refresh")
+    return {"ok": True, **summary, "context": context, "warning": "; ".join(notices)}
+
+async def _sequence_nest_candidate(body):
+    import sequence_nesting
+    project, expected = _workflow_capture(body)
+    for key in ("actor", "client"):
+        if key in body and (not isinstance(body[key], str) or not body[key].strip() or len(body[key]) > 120):
+            raise HTTPException(422, "Nest actor/client must be nonempty text of at most 120 characters")
+    try: planned = await _owned_render_thread(sequence_nesting.plan, project, body)
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, str(error)) from error
+    with LOCK: require_project_context({"_context": expected}, active_id(), load_project())
+    report = {"context": expected, **{key: planned[key] for key in ("ok", "kind", "sequence", "clip_ids", "settings", "issues", "summary", "fingerprint")}}
+    return {"project": project, "expected": expected, "plan": planned, "report": report}
+
+
+async def _commit_sequence_nest(candidate, body):
+    _source_command_policy(body)
+    planned = candidate["plan"]; summary = planned["summary"]
+    envelope = {"kind": "sequence_nesting", "project": candidate["expected"]["project"], "changed": True,
+        "sequence": planned["sequence"], "child_sequence": summary["child_sequence"], "source_clip_ids": planned["clip_ids"],
+        "wrapper_clip_ids": summary["wrapper_clip_ids"], "summary": summary, "warnings": summary["warnings"], "message": summary["message"]}
+    return await _workflow_commit(candidate["project"], candidate["expected"], envelope, "nest", body.get("actor", "human"))
+
+
+@app.post("/api/sequence/nest/review")
+async def sequence_nest_review(req: Request):
+    return (await _sequence_nest_candidate(await req.json()))["report"]
+
+
+@app.post("/api/sequence/nest")
+async def sequence_nest(req: Request):
+    body = await req.json()
+    if not isinstance(body, dict) or not isinstance(body.get("fingerprint"), str) or len(body["fingerprint"]) != 64 or any(c not in "0123456789abcdef" for c in body["fingerprint"]):
+        raise HTTPException(400, "Nest requires the exact reviewed fingerprint and saved context; review it first")
+    _source_command_policy(body)
+    candidate = await _sequence_nest_candidate(body); planned = candidate["plan"]
+    if body["fingerprint"] != planned["fingerprint"]: raise HTTPException(409, "The reviewed nesting changed; review the saved selection again")
+    if not planned["ok"]: raise HTTPException(422, candidate["report"])
+    try:
+        apply_ops(candidate["project"], planned["ops"])
+        parse_project(json.dumps(candidate["project"], allow_nan=False).encode("utf-8"))
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, str(error)) from error
+    commit = asyncio.create_task(_commit_sequence_nest(candidate, body))
+    try: return await asyncio.shield(commit)
+    except asyncio.CancelledError:
+        while not commit.done():
+            try: await asyncio.shield(commit)
+            except asyncio.CancelledError: continue
+            except Exception: break
+        if not commit.cancelled(): commit.exception()
+        raise
+
+
+async def _clip_attributes_candidate(body):
+    import clip_attributes
+    project, expected = _workflow_capture(body)
+    for key in ("actor", "client"):
+        if key in body and (not isinstance(body[key], str) or not body[key].strip() or len(body[key]) > 120):
+            raise HTTPException(422, "Attribute actor/client must be nonempty text of at most 120 characters")
+    try: planned = await _owned_render_thread(clip_attributes.inspect, project, body)
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(422, str(error)) from error
+    with LOCK: require_project_context({"_context": expected}, active_id(), load_project())
+    report = {"context": expected, **{key: planned[key] for key in ("ok", "kind", "sequence", "clip_ids", "donor", "settings", "issues", "summary", "fingerprint")}}
+    return {"project": project, "expected": expected, "plan": planned, "report": report}
+
+
+async def _commit_clip_attributes(candidate, body):
+    import clip_attributes
+    _source_command_policy(body)
+    planned = candidate["plan"]; summary = planned["summary"]
+    envelope = {"kind": "clip_attributes", "project": candidate["expected"]["project"], "changed": bool(planned["ops"]),
+        "sequence": planned["sequence"], "source_clip_id": planned["donor"]["clip"]["id"], "target_clip_ids": planned["clip_ids"],
+        "changed_clip_ids": summary["changed_clip_ids"], "summary": summary, "warnings": summary["warnings"], "message": summary["message"]}
+    # Metadata-only stat checks are bounded and final; no file reading or await occurs under the commit lock.
+    with LOCK:
+        require_project_context({"_context": candidate["expected"]}, active_id(), load_project())
+        try:
+            if clip_attributes.resource_stamps(planned["resources"]) != planned["resource_stamps"]:
+                raise HTTPException(409, "An attribute resource changed; review the transfer again")
+        except OSError as error: raise HTTPException(409, "An attribute resource became unavailable; review again") from error
+        if not planned["ops"]: return {"ok": True, **envelope, "context": candidate["expected"]}
+    return await _workflow_commit(candidate["project"], candidate["expected"], envelope, "clip_attributes", body.get("actor", "human"))
+
+
+@app.post("/api/clip/attributes/review")
+async def clip_attributes_review(req: Request):
+    return (await _clip_attributes_candidate(await req.json()))["report"]
+
+
+@app.post("/api/clip/attributes")
+async def clip_attributes_apply(req: Request):
+    body = await req.json()
+    if not isinstance(body, dict) or not isinstance(body.get("fingerprint"), str) or len(body["fingerprint"]) != 64 or any(c not in "0123456789abcdef" for c in body["fingerprint"]):
+        raise HTTPException(400, "Paste Attributes requires its exact reviewed fingerprint and saved context")
+    _source_command_policy(body)
+    candidate = await _clip_attributes_candidate(body); planned = candidate["plan"]
+    if body["fingerprint"] != planned["fingerprint"]: raise HTTPException(409, "The reviewed attribute transfer changed; review it again")
+    if not planned["ok"]: raise HTTPException(422, candidate["report"])
+    try:
+        apply_ops(candidate["project"], planned["ops"])
+        parse_project(json.dumps(candidate["project"], allow_nan=False).encode("utf-8"))
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, str(error)) from error
+    commit = asyncio.create_task(_commit_clip_attributes(candidate, body))
+    try: return await asyncio.shield(commit)
+    except asyncio.CancelledError:
+        while not commit.done():
+            try: await asyncio.shield(commit)
+            except asyncio.CancelledError: continue
+            except Exception: break
+        if not commit.cancelled(): commit.exception()
+        raise
+
+
+async def _multicam_flatten_candidate(body):
+    import multicam_flatten
+    project, expected = _workflow_capture(body)
+    for key in ("actor", "client"):
+        if key in body and (not isinstance(body[key], str) or not body[key].strip() or len(body[key]) > 120):
+            raise HTTPException(422, "Flatten actor/client must be nonempty text of at most 120 characters")
+    try: planned = await _owned_render_thread(multicam_flatten.plan, project, body)
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, str(error)) from error
+    with LOCK: require_project_context({"_context": expected}, active_id(), load_project())
+    report = {"context": expected, **{key: planned[key] for key in ("ok", "kind", "sequence", "clip_ids", "settings", "issues", "summary", "fingerprint")}}
+    return {"project": project, "expected": expected, "plan": planned, "report": report}
+
+
+async def _commit_multicam_flatten(candidate, body):
+    _source_command_policy(body)
+    planned = candidate["plan"]; summary = planned["summary"]
+    envelope = {"kind": "multicam_flatten", "project": candidate["expected"]["project"], "changed": bool(planned["ops"]),
+        "sequence": planned["sequence"], "source_clip_ids": planned["clip_ids"],
+        "replacement_clip_ids": summary["replacement_clip_ids"], "summary": summary, "warnings": summary["warnings"], "message": summary["message"]}
+    return await _workflow_commit(candidate["project"], candidate["expected"], envelope, "multicam_flatten", body.get("actor", "human"))
+
+
+@app.post("/api/multicam/flatten/review")
+async def multicam_flatten_review(req: Request):
+    return (await _multicam_flatten_candidate(await req.json()))["report"]
+
+
+@app.post("/api/multicam/flatten")
+async def multicam_flatten_apply(req: Request):
+    body = await req.json()
+    if not isinstance(body, dict) or not isinstance(body.get("fingerprint"), str) or len(body["fingerprint"]) != 64 or any(c not in "0123456789abcdef" for c in body["fingerprint"]):
+        raise HTTPException(400, "Flatten requires the exact reviewed fingerprint and saved context; review it first")
+    _source_command_policy(body)
+    candidate = await _multicam_flatten_candidate(body); planned = candidate["plan"]
+    if body["fingerprint"] != planned["fingerprint"]: raise HTTPException(409, "The reviewed multicamera edit changed; review the saved selection again")
+    if not planned["ok"]: raise HTTPException(422, candidate["report"])
+    try:
+        apply_ops(candidate["project"], planned["ops"])
+        parse_project(json.dumps(candidate["project"], allow_nan=False).encode("utf-8"))
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, str(error)) from error
+    commit = asyncio.create_task(_commit_multicam_flatten(candidate, body))
+    try: return await asyncio.shield(commit)
+    except asyncio.CancelledError:
+        while not commit.done():
+            try: await asyncio.shield(commit)
+            except asyncio.CancelledError: continue
+            except Exception: break
+        if not commit.cancelled(): commit.exception()
+        raise
+
+
+async def _commit_sequence_creation(project, expected, planned, body):
+    _source_command_policy(body)
+    envelope = {"kind": "sequence_creation", "mode": planned["mode"], "changed": True, "project": expected["project"],
+        "sequence": planned["sequence"]["id"], "source_sequence": planned["source_sequence"],
+        "media_id": planned["media_id"], "clip_id": planned["clip_id"], "summary": planned["summary"],
+        "warnings": planned["warnings"], "message": planned["summary"]["message"]}
+    return await _workflow_commit(project, expected, envelope, "sequence_create", body.get("actor", "human"))
+
+
+@app.post("/api/sequence/create")
+async def sequence_create(req: Request):
+    import sequence_creation
+    body = await req.json(); project, expected = _workflow_capture(body)
+    _source_command_policy(body)
+    for key in ("actor", "client"):
+        if key in body and (not isinstance(body[key], str) or not body[key].strip() or len(body[key]) > 120):
+            raise HTTPException(422, "Sequence actor/client must be nonempty text of at most 120 characters")
+    try:
+        planned = await asyncio.to_thread(sequence_creation.plan, project, body, identity=uuid.uuid4().hex)
+        apply_ops(project, planned["ops"])
+        parse_project(json.dumps(project, allow_nan=False).encode("utf-8"))
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, str(error)) from error
+    with LOCK: require_project_context({"_context": expected}, active_id(), load_project())
+    commit = asyncio.create_task(_commit_sequence_creation(project, expected, planned, body))
+    try: return await asyncio.shield(commit)
+    except asyncio.CancelledError:
+        while not commit.done():
+            try: await asyncio.shield(commit)
+            except asyncio.CancelledError: continue
+            except Exception: break
+        if not commit.cancelled(): commit.exception()
+        raise
+
+
+@app.post("/api/clip/replace-source")
+async def clip_replace_source(req: Request):
+    import source_replacement
+    body = await req.json(); project, expected = _workflow_capture(body)
+    if body.get("actor", "human") != "human":
+        try:
+            with open(P("settings.json"), encoding="utf-8") as stream: mode = json.load(stream).get("agent_mode") or "direct"
+        except FileNotFoundError: mode = "direct"
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            raise HTTPException(403, "Could not read agent editing preferences; repair settings before source replacement") from error
+        if mode == "proposals_only": raise HTTPException(403, "Direct agent edits are disabled. Ask the editor to replace the source or submit a proposal.")
+    try:
+        planned = source_replacement.plan(project, body)
+        if not planned["changed"]: return {"ok": True, **planned["summary"], "context": expected}
+        apply_ops(project, [{"op": "set", "path": planned["path"], "value": planned["clip"]}])
+        parse_project(json.dumps(project, allow_nan=False).encode("utf-8"))
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, str(error)) from error
+    return await _workflow_commit(project, expected, planned["summary"], "replace_source", body.get("actor", "human"))
+
+@app.post("/api/workflow/action")
+async def workflow_action(req: Request):
+    import editing_workflow
+    body = await req.json(); proj, expected = _workflow_capture(body)
+    try: after, summary = editing_workflow.build(proj, body)
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(400, str(error)) from error
+    return await _workflow_commit(after, expected, summary, body["action"], body.get("actor", "human"))
+
+@app.post("/api/workflow/transcribe")
+async def workflow_transcribe(req: Request):
+    return await _workflow_transcription(await req.json(), words=True, required=True)
+
+async def _workflow_transcription(body, *, words, required=False):
+    import editing_workflow
+    proj, expected = _workflow_capture(body, required=required)
+    sid = body.get("sequence", "seq1"); model = body.get("model", "base")
+    if model not in ("tiny", "base", "small", "medium", "large-v3"):
+        raise HTTPException(400, "Choose a supported speech model")
+    try: seq = editing_workflow.sequence(proj, sid)
+    except ValueError as error: raise HTTPException(400, str(error)) from error
+    if not any(t.get("clips") for t in seq["tracks"]): raise HTTPException(400, "Add footage to this sequence first")
+    # Fail before rendering a potentially long WAV if the optional engine is absent.
+    try:
+        import faster_whisper
+    except ImportError:
+        if getattr(sys, "frozen", False):
+            return JSONResponse({"error": "Speech tools are unavailable in this packaged build. Use the source installation with --with-whisper for transcription; in-place installation into an executable is not supported."}, status_code=501)
+        if words:
+            return JSONResponse({"error": "Speech tools are not installed. Open System Check → Install auto-captions, then retry. The first transcription downloads the selected model."}, status_code=501)
+        try: import whisper
+        except ImportError:
+            return JSONResponse({"error": "Speech tools are not installed. Open System Check → Install auto-captions, then retry."}, status_code=501)
+    result = await _owned_render_thread(_transcribe_sequence, proj, sid, model, word_timestamps=words)
+    if isinstance(result, JSONResponse): return result
+    transcript_words, caps = result
+    if words and not transcript_words:
+        raise HTTPException(400, "No speech was detected. Check that dialogue is audible and try again.")
+    replace_captions = not words or body.get("captions", not required)
+    if words:
+        old_timing = [(w.get("w"), w.get("s"), w.get("e")) for w in seq.get("transcript", [])]
+        new_timing = [(w.get("w"), w.get("s"), w.get("e")) for w in transcript_words]
+        if not replace_captions and old_timing != new_timing and seq.get("captions"):
+            seq.setdefault("workflow", {})["caption_review_ids"] = [c["id"] for c in seq["captions"]]
+        seq["transcript"] = transcript_words
+        seq["transcript_basis"] = editing_workflow.transcript_basis(seq, proj)
+    if replace_captions:
+        seq["captions"] = caps
+        seq.setdefault("workflow", {})["caption_review_ids"] = []
+    return await _workflow_commit(proj, expected, {"sequence": sid, "words": len(transcript_words), "captions": len(caps), "count": len(caps),
+        "message": f"Transcribed {len(transcript_words)} words" if words else f"Created {len(caps)} captions"}, "transcribe", body.get("actor", "human"))
+
+@app.post("/api/workflow/import")
+async def workflow_import(req: Request, files: list[UploadFile] = File(...)):
+    try: body = {"_context": json.loads(req.headers.get("x-filmocity-context", "null"))}
+    except (ValueError, TypeError): raise HTTPException(400, "Invalid project context") from None
+    proj, expected = _workflow_capture(body)
+    if not 1 <= len(files) <= 100: raise HTTPException(400, "Import 1–100 files at a time")
+    project_file = P("projects", expected["project"], "project.json")
+    added, paths = [], []
+    os.makedirs(P("media"), exist_ok=True); os.makedirs(P("thumbs"), exist_ok=True)
+    committed = False
+    try:
+        for upload in files:
+            # A filename is a display label, never a destination path.
+            name = (upload.filename or "Media").replace("\\", "/").split("/")[-1][:240] or "Media"
+            suffix = os.path.splitext(name)[1]
+            if len(suffix) > 12 or not all(c.isalnum() or c == "." for c in suffix): suffix = ""
+            dest = P("media", uuid.uuid4().hex + suffix); paths.append(dest)
+            def copy_upload(proc_holder=None):
+                with open(dest, "xb") as stream: shutil.copyfileobj(upload.file, stream)
+            await _owned_render_thread(copy_upload)
+            try: info = await _owned_render_thread(lambda proc_holder=None: probe(dest))
+            except (ValueError, OSError) as error: raise HTTPException(400, f"Could not read {name}") from error
+            if not (info.get("has_video") or info.get("has_audio")) or not math.isfinite(info.get("duration", 0)) or info.get("duration", 0) <= 0:
+                raise HTTPException(400, f"{name} has no supported media streams or duration")
+            mid, token = uuid.uuid4().hex[:16], uuid.uuid4().hex
+            media = {"id": mid, "name": name, "path": dest, **info, "thumb": None, "strip": None, "wave": None,
+                     "status": "ingesting", "added": time.time(), "ingest_token": token, "workflow_import": True}
+            proj["media"][mid] = media; added.append(media)
+        # Keep files on uncertain commit failure: recovery may need them. An
+        # optimistic-context rejection is known to precede the transaction.
+        committed = True
+        try:
+            result = await _workflow_commit(proj, expected, {"added": [m["id"] for m in added], "message": f"Imported {len(added)} files"}, "import")
+        except HTTPException:
+            committed = False; raise
+        for media in added:
+            try:
+                finish_ingest(media["id"], media["path"], media, project_file, media["ingest_token"])
+            except RuntimeError: result["warning"] += " Thumbnail preparation could not start; imported originals remain available."
+        return result
+    finally:
+        if not committed:
+            for path in paths:
+                try: os.remove(path)
+                except FileNotFoundError: pass
+
+# ---------- owned sequence transcription ----------
+def _transcribe_sequence(proj, seq_id, model, *, word_timestamps=False, proc_holder=None, progress=None):
+    """The private WAV lives through encoding and lazy transcription readers."""
+    with RenderContext(proc_holder=proc_holder) as context:
+        wav = context.new_file(".wav")
+        if progress: progress("Preparing audio", None)
+        do_render(proj, seq_id, wav, {"format": "audio", "acodec": "wav"}, context=context, progress=(lambda value: progress("Preparing audio", value)) if progress else None)
+        context.check_cancelled()
+        from work_budget import work
+        with work(context.holder, 'speech', check=context.check_cancelled):
+            if progress: progress("Loading speech model", None, "First use may download the selected model.")
+            words, caps = [], []
+            segs = speech_model = None
+            try:
+                try:
+                    from faster_whisper import WhisperModel
+                    speech_model = WhisperModel(model, compute_type="int8")
+                    segs, _ = speech_model.transcribe(wav, vad_filter=True, word_timestamps=word_timestamps)
+                    for sg in segs:
+                        context.check_cancelled()
+                        if progress: progress("Transcribing", min(.999, float(sg.end) / max(.01, seq_total(next(s for s in proj["sequences"] if s["id"] == seq_id)))))
+                        caps.append({"id": str(uuid.uuid4())[:8], "start": float(sg.start), "end": float(sg.end), "text": sg.text.strip()})
+                        if word_timestamps:
+                            for w in (sg.words or []): words.append({"w": w.word.strip(), "s": float(w.start), "e": float(w.end), "p": float(getattr(w, "probability", 1.0))})
+                except ImportError:
+                    if word_timestamps:
+                        return JSONResponse({"error": "faster-whisper is not installed. Run the installer with --with-whisper (or pip install faster-whisper in Filmocity/.venv)."}, status_code=501)
+                    try:
+                        import whisper
+                        speech_model = whisper.load_model(model)
+                        res = speech_model.transcribe(wav)
+                        caps = [{"id": str(uuid.uuid4())[:8], "start": float(sg["start"]), "end": float(sg["end"]), "text": sg["text"].strip()} for sg in res["segments"]]
+                    except ImportError:
+                        return JSONResponse({"error": "No transcriber installed. Run the installer with --with-whisper (or pip install faster-whisper in Filmocity/.venv), then retry."}, status_code=501)
+            finally:
+                try:
+                    close = getattr(segs, 'close', None)
+                    if close: close()
+                finally:
+                    segs = speech_model = None
+        context.check_cancelled()
+        return words, caps
+
+
+# ---------- persistent background preparation and analysis ----------
+def _task_transcribe(payload, task):
+    project, sid = payload["project"], payload["sequence"]
+    _, signature = task_inputs.capture(project, sid)
+    if signature != payload["signature"]: raise ValueError("Source files changed before transcription; start a new task")
+    result = _transcribe_sequence(project, sid, payload["model"], word_timestamps=True, proc_holder=task.holder, progress=task.progress)
+    if isinstance(result, JSONResponse): raise ValueError("Speech tools are unavailable; open System Check")
+    words, _ = result
+    if not words: raise ValueError("No speech detected. Check that dialogue is audible.")
+    task.check()
+    if task_inputs.capture(project, sid)[1] != signature: raise ValueError("Source files changed during transcription; start a new task")
+    import editing_workflow
+    seq = editing_workflow.sequence(project, sid); seq["transcript"] = words
+    seq["transcript_basis"] = editing_workflow.transcript_basis(seq, project)
+    editing_workflow.words_of(seq, project)
+    return {"words": words, "sequence": sid, "signature": signature}
+
+def _task_package(payload, task):
+    from project_package import export_package, import_package
+    common = dict(check=task.check, progress=task.progress, publish=task.commit_result)
+    if payload["mode"] == "package":
+        task.progress("Collecting project resources", None, "Resolving the captured project and its files")
+        return export_package(payload["project"], payload["destination"], task.id, **common)
+    task.progress("Verifying package", None, "Checking the manifest and resource hashes")
+    return import_package(payload["manifest"], payload["destination"], task.id, **common)
+
+@app.post("/api/tasks/package")
+async def background_package(req: Request):
+    return _queue_package(await req.json(), "package")
+
+@app.post("/api/tasks/package_import")
+async def background_package_import(req: Request):
+    return _queue_package(await req.json(), "package_import")
+
+def _queue_package(body, mode):
+    if TASKS is None: raise HTTPException(503, "Background tasks are unavailable")
+    project, expected = _workflow_capture(body)
+    with LOCK:
+        root = ROOT
+        if workspace_id(root) != expected["workspace"]: raise HTTPException(409, "Workspace changed")
+    path = body.get("path")
+    if not isinstance(path, str) or not path.strip() or not os.path.isabs(path.strip()):
+        raise HTTPException(400, "Enter a full local folder path or package manifest path")
+    path = os.path.abspath(path.strip())
+    payload = {"mode": mode, "root": root}
+    if mode == "package": payload.update(project=project, destination=path)
+    else: payload.update(manifest=path, destination=os.path.join(root, "projects"))
+    try:
+        task = TASKS.submit(mode, project.get("name", "Project") if mode == "package" else "Import project package",
+                            expected, payload, identity=body.get("request_id"))
+    except (TaskError, OSError) as error: raise HTTPException(409, str(error)) from error
+    return {"ok": True, "task": task, "context": expected,
+            "message": "Package queued. See Tasks for progress and the verified result."}
+
+@app.get("/api/tasks")
+def background_task_list():
+    if TASKS is None: raise HTTPException(503, "Background tasks are unavailable")
+    with LOCK:
+        pid = active_id(); context = project_context(ROOT, pid, load_project())
+    return {**TASKS.catalog(pid), "context": context}
+
+@app.post("/api/tasks/transcribe")
+async def background_transcribe(req: Request):
+    import editing_workflow
+    body = await req.json(); proj, expected = _workflow_capture(body)
+    sid = body.get("sequence"); model = body.get("model", "base")
+    if model not in ("tiny", "base", "small", "medium", "large-v3"): raise HTTPException(400, "Choose a supported speech model")
+    try:
+        seq = editing_workflow.sequence(proj, sid)
+        if not any(t.get("clips") for t in seq["tracks"]): raise ValueError("Add footage before transcription")
+        snapshot, signature = task_inputs.capture(proj, sid)
+    except (ValueError, OSError, KeyError) as error: raise HTTPException(400, str(error)) from error
+    try: import faster_whisper
+    except ImportError:
+        detail = "Speech tools are unavailable in this packaged build. Use a speech-enabled source installation." if getattr(sys, "frozen", False) else "Speech tools are missing. Open System Check → Install auto-captions."
+        raise HTTPException(501, detail)
+    try:
+        task = TASKS.submit("transcribe", seq.get("name", "Sequence"), expected,
+            {"sequence": sid, "model": model, "project": snapshot, "signature": signature}, identity=body.get("request_id"))
+    except (TaskError, OSError) as error: raise HTTPException(409, str(error)) from error
+    return {"ok": True, "task": task, "context": expected, "message": "Transcription queued. Keep editing; apply the result from Tasks when ready."}
+
+def _owned_task(identity):
+    try: value = TASKS.get(identity)
+    except TaskError as error: raise HTTPException(404, str(error)) from error
+    with LOCK:
+        if value["record"]["context"]["workspace"] != workspace_id(ROOT) or value["record"]["context"]["project"] != active_id():
+            raise HTTPException(409, "Open the task's original project first")
+    return value
+
+@app.post("/api/tasks/{identity}/cancel")
+def background_task_cancel(identity: str):
+    value = _owned_task(identity)
+    try: task = TASKS.cancel(identity)
+    except TaskError as error: raise HTTPException(409, str(error)) from error
+    if value["record"]["kind"] == "media" and value["record"]["status"] == "queued" and task["status"] == "cancelled":
+        _task_media_update(value["payload"], {"status": "cancelled", "ingest_error": "Preparation cancelled before starting", "task_id": identity})
+    return {"ok": True, "task": task}
+
+@app.get("/api/tasks/{identity}/result")
+def background_task_result(identity: str):
+    value = _owned_task(identity)
+    if value["result"] is None: raise HTTPException(409, "No completed task result is available")
+    return JSONResponse({"task": value["record"], "result": value["result"]}, headers={"Content-Disposition": 'attachment; filename="Filmocity-' + ({'transcribe': 'transcript', 'collect': 'collection-receipt', 'sync': 'sync-result', 'analysis': 'analysis-result', 'audio_analysis': 'audio-result', 'recipe': 'recipe-result', 'cover': 'cover-result', 'render_replace': 'render-receipt'}.get(value['record']['kind'], 'package-receipt')) + '-' + identity + '.json"'})
+
+@app.post("/api/tasks/{identity}/retry")
+async def background_task_retry(identity: str, req: Request):
+    value = _owned_task(identity); body = await req.json(); proj, expected = _workflow_capture(body)
+    record, payload = value["record"], value["payload"]
+    if record["context"]["project"] != expected["project"]: raise HTTPException(409, "Project changed")
+    if record["status"] not in ("cancelled", "error", "interrupted"): raise HTTPException(409, "Only failed, cancelled or interrupted tasks can be retried")
+    try:
+        if record["kind"] == "cover":
+            import cover_workflow as cover
+            await asyncio.to_thread(cover.validate_current, proj, payload, expected, ROOT, ASSETS)
+            with LOCK:
+                require_project_context({"_context": expected}, active_id(), load_project())
+                task = TASKS.submit(record["kind"], record["name"], expected, payload, identity=body.get("request_id"), retry_of=identity)
+            return {"ok": True, "task": task}
+        elif record["kind"] == "recipe":
+            import recipe_workflow as recipe
+            await asyncio.to_thread(recipe.validate_current, proj, payload, expected, ROOT, ASSETS)
+            with LOCK:
+                require_project_context({"_context": expected}, active_id(), load_project())
+                task = TASKS.submit(record["kind"], record["name"], expected, payload, identity=body.get("request_id"), retry_of=identity)
+            return {"ok": True, "task": task}
+        elif record["kind"] == "audio_analysis":
+            import audio_workflow as audio
+            await asyncio.to_thread(audio.validate_current, proj, payload, expected)
+            with LOCK:
+                require_project_context({"_context": expected}, active_id(), load_project())
+                task = TASKS.submit(record["kind"], record["name"], expected, payload, identity=body.get("request_id"), retry_of=identity)
+            return {"ok": True, "task": task}
+        elif record["kind"] == "sync":
+            import audio_sync as sync
+            await asyncio.to_thread(sync.validate_current, proj, payload, expected)
+            with LOCK:
+                require_project_context({"_context": expected}, active_id(), load_project())
+                task = TASKS.submit(record["kind"], record["name"], expected, payload, identity=body.get("request_id"), retry_of=identity)
+            return {"ok": True, "task": task}
+        elif record["kind"] == "render_replace":
+            import render_replace as bake
+            bake.validate_current(proj, payload, expected, ROOT)
+        elif record["kind"] == "analysis":
+            import media_analysis
+            media_analysis.validate_current(proj, payload, expected)
+        elif record["kind"] == "transcribe":
+            if task_inputs.capture(proj, payload["sequence"])[1] != payload["signature"]: raise ValueError("The analysis input changed. Start a new transcription from the current sequence.")
+        elif record["kind"] == "collect":
+            from collection_workflow import current_inputs
+            if os.path.abspath(payload["root"]) != os.path.abspath(ROOT): raise ValueError("Workspace changed")
+            current_inputs(proj, payload)
+            # The worker revalidates captured file identities before copying.
+        elif record["kind"] in ("package", "package_import"):
+            if os.path.abspath(payload["root"]) != os.path.abspath(ROOT): raise ValueError("Workspace changed; start a new package task")
+            # Retry the captured snapshot. A new request exports current edits.
+        elif not _task_media_current(payload) or task_inputs.source_stamp({**payload["info"], "path": payload["path"]}) != payload["stamp"]:
+            raise ValueError("Media changed; prepare the current media instead")
+        task = TASKS.submit(record["kind"], record["name"], expected, payload, identity=body.get("request_id"), retry_of=identity)
+    except (TaskError, ValueError, OSError, MediaCollectionError) as error: raise HTTPException(409, str(error)) from error
+    return {"ok": True, "task": task}
+
+@app.post("/api/tasks/media/{mid}/prepare")
+async def background_media_prepare(mid: str, req: Request):
+    proj, expected = _workflow_capture(await req.json()); media = proj.get("media", {}).get(mid)
+    if not media or not media.get("ingest_token"): raise HTTPException(400, "Relink this media to establish a preparation source")
+    if media.get("audio_alias"):
+        import source_commands
+        try: media = source_commands.alias_source(proj, media)
+        except (ValueError, KeyError, TypeError) as error: raise HTTPException(409, str(error)) from error
+    result = finish_ingest(mid, media["path"], media, P("projects", expected["project"], "project.json"), media["ingest_token"])
+    if result.get("error"): raise HTTPException(409, result["error"])
+    return {"ok": True, "task": result}
+
+@app.post("/api/tasks/{identity}/apply")
+async def background_task_apply(identity: str, req: Request):
+    import editing_workflow
+    value = _owned_task(identity); body = await req.json(); proj, expected = _workflow_capture(body)
+    record, payload = value["record"], value["payload"]
+    if record["kind"] == "recipe": return await _apply_recipe_workflow(identity, value, body, proj, expected)
+    if record["kind"] == "audio_analysis": return await _apply_audio_workflow(identity, value, body, proj, expected)
+    if record["kind"] == "sync": return await _apply_audio_sync(identity, value, body, proj, expected)
+    if record["kind"] == "render_replace": return await _apply_render_replace(identity, value, body, proj, expected)
+    if record["kind"] == "analysis": return await _apply_media_analysis(identity, value, body, proj, expected)
+    if record["kind"] == "collect": return await _apply_collection(identity, value, body, proj, expected)
+    if record["kind"] != "transcribe" or record["context"]["project"] != expected["project"]: raise HTTPException(409, "This task cannot update this project")
+    try: seq = editing_workflow.sequence(proj, payload["sequence"])
+    except ValueError as error: raise HTTPException(409, str(error)) from error
+    # The task marker commits atomically with the transcript/history. A lost
+    # reply or task-receipt write cannot duplicate the project mutation.
+    if seq.get("workflow", {}).get("transcript_task") == identity:
+        TASKS.finish_apply(identity, success=True, message="Transcript already applied")
+        return {"ok": True, "context": expected, "sequence": seq["id"], "message": "Transcript already applied"}
+    try:
+        if task_inputs.capture(proj, seq["id"])[1] != payload["signature"]:
+            raise ValueError("The sequence, transcript or source changed. Download this result for reference, or start a new transcription.")
+        claimed = TASKS.begin_apply(identity)
+    except (ValueError, OSError) as error: raise HTTPException(409, str(error)) from error
+    try:
+        words = claimed["result"]["words"]
+        if seq.get("captions") and seq.get("transcript") != words:
+            seq.setdefault("workflow", {})["caption_review_ids"] = [c["id"] for c in seq["captions"]]
+        seq["transcript"] = copy.deepcopy(words); seq["transcript_basis"] = editing_workflow.transcript_basis(seq, proj)
+        editing_workflow.words_of(seq, proj)
+        seq.setdefault("workflow", {})["transcript_task"] = identity
+        result = await _workflow_commit(proj, expected, {"sequence": seq["id"], "words": len(words),
+            "message": f"Applied {len(words)} transcribed words. Existing caption edits were preserved."}, "transcribe", body.get("actor", "human"))
+    except BaseException:
+        TASKS.finish_apply(identity, success=False, message="Apply did not finish. Check project/recovery before retrying.")
+        raise
+    task = TASKS.finish_apply(identity, success=True, message="Transcript applied")
+    if task.get("warning"): result["warning"] = (result.get("warning", "") + "; " + task["warning"]).strip('; ')
+    return result
+
 
 # ---------- feed-forward advisor: learn preferences from decisions, score proposals ----------
 ADVISOR = {"model": None, "rules": {}, "trained": 0}
@@ -862,29 +2233,84 @@ def media_probe(media_id: str):
     return {"media": m, "probe": json.loads(out or "{}")}
 
 # ---------- diagnostics + sample project + backups ----------
-PREVIEW_PRESET = {"crf": 20, "x264_preset": "veryfast", "vcodec": "libx264"}
+def preview_state(body=None):
+    with LOCK:
+        pid = active_id(); project = copy.deepcopy(load_project())
+        require_project_context(body or {}, pid, project)
+        return project, project_context(ROOT, pid, project)
+
+def preview_descriptor(job, project, context, revisions=None):
+    binding = job.get("preview")
+    if job.get("status") != "done" or not binding or not matches_context(binding["context"], context): return None
+    try: current = preview_binding(project, context, binding["sequence"], binding["ranged"], revisions)
+    except ValueError: return None
+    if current != binding: return None
+    from export_storage import output_path
+    try: path = output_path(P("renders"), job.get("out"))
+    except (ValueError, OSError): return None
+    if not os.path.isfile(path) or os.path.getsize(path) <= 0: return None
+    return {"id": job["id"], "out": job["out"], "preview": copy.deepcopy(binding)}
+
 @app.get("/api/render/segments")
-def render_segments(sequence: str = "seq1"):
-    """Render bar: the sequence's export segments and whether each is already cached for the preview preset (green) or not (red)."""
-    proj = load_project(); seq = next((s for s in proj["sequences"] if s["id"] == sequence), None)
+def render_segments(sequence: str = "seq1", start: float | None = None, end: float | None = None):
+    """Cache coverage and a validated preview; arbitrary old filenames are not adopted."""
+    proj, context = preview_state(); seq = next((s for s in proj["sequences"] if s["id"] == sequence), None)
     if not seq: raise HTTPException(404)
-    pts = segment_boundaries(seq); cache = P("renders", "cache"); out = []
-    for t0, t1 in zip(pts, pts[1:]):
-        key = chunk_key(proj, chunk_sequence(seq, t0, t1), PREVIEW_PRESET); out.append({"t0": t0, "t1": t1, "cached": os.path.exists(os.path.join(cache, key + ".mp4"))})
-    return {"segments": out, "preview": f"/renders/preview_{sequence}.mp4" if os.path.exists(P("renders", f"preview_{sequence}.mp4")) else None}
+    import math
+    if (start is None) != (end is None) or (start is not None and
+            (not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start)):
+        raise HTTPException(422, "Render coverage requires a finite, nonnegative start and a later end.")
+    pts = segment_boundaries(seq); cache = P("renders", "cache"); out = []; revisions = {}
+    index = index_sequence(seq)
+    with RENDER_STATE_LOCK: candidates = [copy.deepcopy(j) for j in JOBS.values() if j.get("sequence") == sequence and j.get("preview") and j.get("status") == "done"]
+    ready = next((d for j in sorted(candidates, key=lambda j: j["started"], reverse=True)
+                  if (d := preview_descriptor(j, proj, context, revisions))), None)
+    from segment_cache import reading, usable
+    try:
+        with reading(cache):
+            for t0, t1 in zip(pts, pts[1:]):
+                if start is not None and (t1 <= start or t0 >= end): continue
+                key = chunk_key(proj, chunk_sequence(seq, t0, t1, index=index), PREVIEW_PRESET, revisions)
+                cached = usable(os.path.join(cache, key + ".mp4"))
+                rendered = bool(ready and ready["preview"]["range"][0] <= t0 and ready["preview"]["range"][1] >= t1)
+                out.append({"t0": t0, "t1": t1, "cached": cached, "rendered": rendered})
+    except (OSError, ValueError) as error:
+        raise HTTPException(422, "Segment cache is unavailable: " + str(error)[:300]) from error
+    # Project changes during filesystem hashing make this response stale.
+    preview_state({"_context": context})
+    return {"context": context, "sequence": sequence, "segments": out, "window": [start, end] if start is not None else None, "preview": None, "ready_preview": ready}
+
+@app.post("/api/render/preview/{jid}/validate")
+async def validate_render_preview(jid: str, req: Request):
+    body = await req.json(); proj, context = preview_state(body)
+    with RENDER_STATE_LOCK: job = copy.deepcopy(JOBS.get(jid))
+    if not job: raise HTTPException(404, "Preview job no longer exists.")
+    ready = await asyncio.to_thread(preview_descriptor, job, proj, context)
+    preview_state({"_context": context})
+    if not ready: raise HTTPException(409, "Preview no longer matches the saved project or source files. Render it again.")
+    return ready
 
 @app.post("/api/render/{jid}/cancel")
 async def render_cancel(jid: str):
-    j = JOBS.get(jid)
-    if not j: raise HTTPException(404)
-    if j["status"] == "queued": j.update(status="error", error="cancelled"); return {"ok": True}
-    h = RENDER_PROCS.get(jid)
-    if h and h.get("proc") and h["proc"].poll() is None:
-        h["cancelled"] = True; j["status"] = "cancelling"; h["proc"].terminate()
-        def _kill(p=h["proc"]):
-            time.sleep(2)
-            if p.poll() is None: p.kill()
-        threading.Thread(target=_kill, daemon=True).start(); return {"ok": True}
+    from job_history import remember
+    with RENDER_STATE_LOCK:
+        j = JOBS.get(jid)
+        if not j: raise HTTPException(404)
+        if j["status"] == "queued":
+            j.update(status="error", error="cancelled", finished=time.time()); remember(ROOT, j)
+            return {"ok": True}
+        h = RENDER_PROCS.get(jid)
+    if h is not None and j["status"] in ("running", "cancelling"):
+        # Build/hash/validation phases need no active encoder. All publication
+        # paths use this lock; cancellation after their commit is refused.
+        with h.setdefault("png_publication_lock", threading.Lock()):
+            if h.get("png_published") or h.get("published"): return {"ok": False}
+            with RENDER_STATE_LOCK:
+                if j["status"] not in ("running", "cancelling"): return {"ok": False}
+                h["cancelled"] = True; j["status"] = "cancelling"; remember(ROOT, j)
+            # The encoder supervisor observes this holder, kills, waits, and
+            # joins its drainers before its context can retire.
+        return {"ok": True}
     return {"ok": False}
 
 @app.get("/api/diagnostics")
@@ -914,92 +2340,195 @@ def diagnostics():
     if out["disk_free_gb"] is not None and out["disk_free_gb"] < 5: out["issues"].append(f"low disk: {out['disk_free_gb']} GB free")
     return out
 
+def _prepare_sample_project(name, pid, expected, actor, check):
+    from project_lifecycle import sample_file
+    d = P("sample_media"); os.makedirs(d, exist_ok=True)
+    gens = [("shot_01_open.mp4", "testsrc2=s=1280x720:r=30", 330), ("shot_02_product.mp4", "smptehdbars=s=1280x720:r=30", 440), ("shot_03_ride.mp4", "rgbtestsrc=s=1280x720:r=30", 550)]
+    for sample_name, src, hz in gens:
+        check()
+        f = os.path.join(d, sample_name)
+        if not os.path.exists(f): sample_file(f, ["ffmpeg", "-hide_banner", "-y", "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", f"sine=frequency={hz}:sample_rate=48000", "-t", "8", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac"], check)
+    mus = os.path.join(d, "music_bed.m4a")
+    if not os.path.exists(mus): sample_file(mus, ["ffmpeg", "-hide_banner", "-y", "-f", "lavfi", "-i", "sine=frequency=110:sample_rate=48000,tremolo=f=2:d=0.9", "-t", "30", "-c:a", "aac"], check)
+    still = os.path.join(d, "end_card.png")
+    if not os.path.exists(still): sample_file(still, ["ffmpeg", "-hide_banner", "-y", "-f", "lavfi", "-i", "color=c=0xE8631C:s=1080x1920", "-frames:v", "1", "-update", "1"], check)
+    proj = default_project(); proj["name"] = name; proj["brief"] = {"client": "Sample Co", "objective": "Show every panel with real content", "platform": "reels", "audience": "you, on first launch", "constraints": "none — this is a tour", "notes": "generated footage; delete this project any time"}
+    ids = {}
+    for f in [os.path.join(d, g[0]) for g in gens] + [mus, still]:
+        mid, m = ingest(f, os.path.basename(f)); proj["media"][mid] = m; ids[os.path.basename(f)] = mid
+    seq = proj["sequences"][0]; seq["name"] = "Tour 9x16"; v1 = next(t for t in seq["tracks"] if t["id"] == "V1"); v2 = next(t for t in seq["tracks"] if t["id"] == "V2"); a2 = next(t for t in seq["tracks"] if t["id"] == "A2")
+    v1["clips"] = [{"id": "s1", "media_id": ids["shot_01_open.mp4"], "start": 0, "in_": 1.0, "out": 4.0, "speed": 1, "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "audio": {"gain_db": 0, "linked": True}, "keyframes": {"transform.scale": [{"t": 0, "v": 1.0}, {"t": 2.8, "v": 1.1, "e": "ease"}]}, "color": {"lut": os.path.join(ASSETS, "luts", "Teal_Orange.cube")}, "note": "the hook — slow push-in, warm look", "fit": "cover"},
+                   {"id": "s2", "media_id": ids["shot_02_product.mp4"], "start": 3.0, "in_": 0.0, "out": 2.5, "speed": 1, "transition_in": {"type": "dissolve", "duration": 0.6}, "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "audio": {"gain_db": 0, "linked": True}, "keyframes": {}, "color": {}, "note": "product beat", "fit": "cover"},
+                   {"id": "s3", "media_id": ids["shot_03_ride.mp4"], "start": 5.5, "in_": 2.0, "out": 5.0, "speed": 1, "transition_in": {"type": "wipe_left", "duration": 0.5}, "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "audio": {"gain_db": 0, "linked": True}, "keyframes": {}, "color": {}, "fx_stack": [{"id": "fx1", "type": "vignette_fx", "enabled": True, "params": {"amount": 0.5}}], "note": "ride beat with a vignette", "fit": "cover"},
+                   {"id": "s4", "media_id": ids["end_card.png"], "start": 8.5, "in_": 0, "out": 3.0, "speed": 1, "transition_in": {"type": "dip_black", "duration": 0.5}, "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "keyframes": {}, "color": {}, "note": "end card"}]
+    v2["clips"] = [{"id": "lt", "media_id": None, "start": 0.4, "in_": 0, "out": 3.0, "speed": 1, "graphic": {"name": "Lower third", "layers": [{"kind": "box", "x": 0.06, "y": 0.72, "w": 0.55, "h": 0.008, "color": "0xE8631C@1.0"}, {"kind": "text", "text": "Jordan Reyes", "size": 70, "align": "left", "valign": "bottom", "y": -40, "color": "white", "shadow": True}, {"kind": "text", "text": "Reviewer · @jr.rides", "size": 38, "align": "left", "valign": "bottom", "y": 40, "color": "0xDDDDDD", "weight": "regular"}]}, "transform": {"opacity": 1}, "transition_in": {"type": "push_left", "duration": 0.35}, "transition_out": {"type": "fade", "duration": 0.3}, "keyframes": {}},
+                   {"id": "url", "media_id": None, "start": 8.7, "in_": 0, "out": 2.8, "speed": 1, "title": {"text": "sampleco.com", "size": 88, "color": "white", "valign": "bottom", "y": -160}, "transform": {"opacity": 1}, "transition_in": {"type": "fade", "duration": 0.3}, "keyframes": {}}]
+    a2["clips"] = [{"id": "mus", "media_id": ids["music_bed.m4a"], "start": 0, "in_": 0, "out": 11.5, "speed": 1, "audio": {"gain_db": -8, "linked": True, "fade_out": 1.0}, "keyframes": {"audio.gain_db": [{"t": 0, "v": -8}, {"t": 0.8, "v": -18, "e": "ease"}, {"t": 8.0, "v": -18}, {"t": 8.6, "v": -8, "e": "ease"}]}, "note": "music bed, ducked under the shots"}]
+    seq["captions"] = [{"id": "c1", "start": 0.3, "end": 2.6, "text": "Built for the rider other e-bikes weren't built for."}, {"id": "c2", "start": 3.2, "end": 5.2, "text": "450 lb payload. Two riders. All day."}, {"id": "c3", "start": 5.8, "end": 8.2, "text": "Full suspension, both ends."}]
+    seq["markers"] = [{"id": "m1", "time": 0.0, "name": "Hook", "type": "chapter", "color": "green"}, {"id": "m2", "time": 3.0, "name": "Product", "type": "chapter", "color": "blue"}, {"id": "m3", "time": 8.5, "name": "End card", "type": "chapter", "color": "orange"}]
+    check()
+    return _commit_prepared_project(proj, expected, pid, actor, "sample", check)
+
 @app.post("/api/projects/sample")
 async def projects_sample(req: Request):
-    """Create a sample project with generated footage (no downloads): three shots, a music bed, a still — cut with captions, a lower third, ducking and a look."""
-    body = await req.json(); d = P("sample_media"); os.makedirs(d, exist_ok=True)
-    gens = [("shot_01_open.mp4", "testsrc2=s=1280x720:r=30", 330), ("shot_02_product.mp4", "smptehdbars=s=1280x720:r=30", 440), ("shot_03_ride.mp4", "rgbtestsrc=s=1280x720:r=30", 550)]
-    for name, src, hz in gens:
-        f = os.path.join(d, name)
-        if not os.path.exists(f): await asyncio.to_thread(subprocess.run, ["ffmpeg", "-hide_banner", "-y", "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", f"sine=frequency={hz}:sample_rate=48000", "-t", "8", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", f], capture_output=True, timeout=300)
-    mus = os.path.join(d, "music_bed.m4a")
-    if not os.path.exists(mus): await asyncio.to_thread(subprocess.run, ["ffmpeg", "-hide_banner", "-y", "-f", "lavfi", "-i", "sine=frequency=110:sample_rate=48000,tremolo=f=2:d=0.9", "-t", "30", "-c:a", "aac", mus], capture_output=True, timeout=120)
-    still = os.path.join(d, "end_card.png")
-    if not os.path.exists(still): await asyncio.to_thread(subprocess.run, ["ffmpeg", "-hide_banner", "-y", "-f", "lavfi", "-i", "color=c=0xE8631C:s=1080x1920", "-frames:v", "1", "-update", "1", still], capture_output=True, timeout=60)
-    name = body.get("name", "Sample — Filmocity tour"); pid = "sample_" + str(uuid.uuid4())[:4]; os.makedirs(P("projects", pid), exist_ok=True)
-    proj = default_project(); proj["name"] = name; proj["brief"] = {"client": "Sample Co", "objective": "Show every panel with real content", "platform": "reels", "audience": "you, on first launch", "constraints": "none — this is a tour", "notes": "generated footage; delete this project any time"}
-    json.dump(proj, open(P("projects", pid, "project.json"), "w"), indent=1); json.dump({"id": pid}, open(P("active.json"), "w"))
-    ids = {}
-    with LOCK:
-        proj = load_project()
-        for f in [os.path.join(d, g[0]) for g in gens] + [mus, still]:
-            mid, m = ingest(f, os.path.basename(f)); proj["media"][mid] = m; ids[os.path.basename(f)] = mid
-        seq = proj["sequences"][0]; seq["name"] = "Tour 9x16"; v1 = next(t for t in seq["tracks"] if t["id"] == "V1"); v2 = next(t for t in seq["tracks"] if t["id"] == "V2"); a2 = next(t for t in seq["tracks"] if t["id"] == "A2")
-        v1["clips"] = [{"id": "s1", "media_id": ids["shot_01_open.mp4"], "start": 0, "in_": 1.0, "out": 4.0, "speed": 1, "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "audio": {"gain_db": 0, "linked": True}, "keyframes": {"transform.scale": [{"t": 0, "v": 1.0}, {"t": 2.8, "v": 1.1, "e": "ease"}]}, "color": {"lut": os.path.join(ASSETS, "luts", "Teal_Orange.cube")}, "note": "the hook — slow push-in, warm look", "fit": "cover"},
-                       {"id": "s2", "media_id": ids["shot_02_product.mp4"], "start": 3.0, "in_": 0.0, "out": 2.5, "speed": 1, "transition_in": {"type": "dissolve", "duration": 0.6}, "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "audio": {"gain_db": 0, "linked": True}, "keyframes": {}, "color": {}, "note": "product beat", "fit": "cover"},
-                       {"id": "s3", "media_id": ids["shot_03_ride.mp4"], "start": 5.5, "in_": 2.0, "out": 5.0, "speed": 1, "transition_in": {"type": "wipe_left", "duration": 0.5}, "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "audio": {"gain_db": 0, "linked": True}, "keyframes": {}, "color": {}, "fx_stack": [{"id": "fx1", "type": "vignette_fx", "enabled": True, "params": {"amount": 0.5}}], "note": "ride beat with a vignette", "fit": "cover"},
-                       {"id": "s4", "media_id": ids["end_card.png"], "start": 8.5, "in_": 0, "out": 3.0, "speed": 1, "transition_in": {"type": "dip_black", "duration": 0.5}, "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "keyframes": {}, "color": {}, "note": "end card"}]
-        v2["clips"] = [{"id": "lt", "media_id": None, "start": 0.4, "in_": 0, "out": 3.0, "speed": 1, "graphic": {"name": "Lower third", "layers": [{"kind": "box", "x": 0.06, "y": 0.72, "w": 0.55, "h": 0.008, "color": "0xE8631C@1.0"}, {"kind": "text", "text": "Jordan Reyes", "size": 70, "align": "left", "valign": "bottom", "y": -40, "color": "white", "shadow": True}, {"kind": "text", "text": "Reviewer · @jr.rides", "size": 38, "align": "left", "valign": "bottom", "y": 40, "color": "0xDDDDDD", "weight": "regular"}]}, "transform": {"opacity": 1}, "transition_in": {"type": "push_left", "duration": 0.35}, "transition_out": {"type": "fade", "duration": 0.3}, "keyframes": {}},
-                       {"id": "url", "media_id": None, "start": 8.7, "in_": 0, "out": 2.8, "speed": 1, "title": {"text": "sampleco.com", "size": 88, "color": "white", "valign": "bottom", "y": -160}, "transform": {"opacity": 1}, "transition_in": {"type": "fade", "duration": 0.3}, "keyframes": {}}]
-        a2["clips"] = [{"id": "mus", "media_id": ids["music_bed.m4a"], "start": 0, "in_": 0, "out": 11.5, "speed": 1, "audio": {"gain_db": -8, "linked": True, "fade_out": 1.0}, "keyframes": {"audio.gain_db": [{"t": 0, "v": -8}, {"t": 0.8, "v": -18, "e": "ease"}, {"t": 8.0, "v": -18}, {"t": 8.6, "v": -8, "e": "ease"}]}, "note": "music bed, ducked under the shots"}]
-        seq["captions"] = [{"id": "c1", "start": 0.3, "end": 2.6, "text": "Built for the rider other e-bikes weren't built for."}, {"id": "c2", "start": 3.2, "end": 5.2, "text": "450 lb payload. Two riders. All day."}, {"id": "c3", "start": 5.8, "end": 8.2, "text": "Full suspension, both ends."}]
-        seq["markers"] = [{"id": "m1", "time": 0.0, "name": "Hook", "type": "chapter", "color": "green"}, {"id": "m2", "time": 3.0, "name": "Product", "type": "chapter", "color": "blue"}, {"id": "m3", "time": 8.5, "name": "End card", "type": "chapter", "color": "orange"}]
-        save_project(proj)
-    ev = log_event({"type": "project_replaced", "actor": "human", "source": "sample_project", "project": pid}); await broadcast(ev); return {"id": pid, "name": name}
+    """Generate and prepare a complete tour before guarded project activation."""
+    from project_lifecycle import COPY_WORKER, ProjectActionError, project_name
+    body = await req.json(); _, expected = _workflow_capture(body)
+    try: name = project_name(body.get("name"), "Sample — Filmocity tour")
+    except ProjectActionError as error: raise HTTPException(400, str(error)) from error
+    pid = "sample-" + uuid.uuid4().hex
+    try:
+        result, event = await COPY_WORKER.run(lambda check: _prepare_sample_project(name, pid, expected, body.get("actor", "human"), check))
+    except (ProjectActionError, subprocess.SubprocessError) as error:
+        raise HTTPException(422, "Sample preparation failed; the active project was kept. " + str(error)[:400]) from error
+    with LOCK: proj = _read_project_target(pid)
+    for m in proj["media"].values(): finish_ingest(m["id"], m["path"], m, P("projects", pid, "project.json"), m["ingest_token"])
+    return await _project_action_notify(result, event)
 
 @app.get("/api/backups")
 def backups_list():
-    d = PP("backups"); return [{"file": f, "ts": float(f.split("_")[1].split(".")[0])} for f in sorted(os.listdir(d), reverse=True)] if os.path.isdir(d) else []
+    return saved_versions("backups")["versions"]
 
 @app.post("/api/backups/restore")
 async def backups_restore(req: Request):
-    body = await req.json(); f = PP("backups", os.path.basename(body["file"]))
-    if not os.path.exists(f): raise HTTPException(404)
-    with LOCK: proj = json.load(open(f)); save_project(proj)
-    ev = log_event({"type": "project_replaced", "actor": body.get("actor", "human"), "source": "backup_restore", "file": body["file"]}); await broadcast(ev); return {"ok": True}
+    return await restore_saved_version(await req.json(), "backups")
 
 @app.post("/api/media/breakout")
 async def media_breakout(req: Request):
-    """Breakout to Mono: two audio-only bin items (Left, Right) from a stereo clip, each mapped to one channel."""
-    body = await req.json(); out = []
-    with LOCK:
-        proj = load_project(); m = proj["media"].get(body["media_id"])
-        if not m or not m.get("has_audio"): raise HTTPException(404)
-        for side in ("left", "right"):
-            nid = str(uuid.uuid4())[:8]; proj["media"][nid] = {**m, "id": nid, "name": f"{os.path.splitext(m['name'])[0]} {side.capitalize()}.wav", "has_video": False, "thumb": None, "strip": None, "channel_mode": side, "breakout_of": m["id"], "added": time.time()}; out.append(nid)
-        save_project(proj)
-    ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": out, "breakout": True}); await broadcast(ev); return {"media": out}
+    return await _source_creation_command(await req.json(), "breakout")
+
+@app.post("/api/media/duplicate")
+async def media_duplicate(req: Request):
+    return await _source_creation_command(await req.json(), "duplicate")
+
+def existing_preview_request(request_id, context, sequence, ranged):
+    if not request_id: return None
+    with RENDER_STATE_LOCK:
+        for job in JOBS.values():
+            if job.get("preview_request") == request_id:
+                binding = job.get("preview") or {}
+                if (binding.get("context") != context or binding.get("sequence") != sequence or binding.get("ranged") != ranged):
+                    raise HTTPException(409, "Preview request identity was already used for a different edit.")
+                return job
+    return None
 
 @app.post("/api/render/preview")
 async def render_preview(req: Request):
-    """Render Entire Sequence (Premiere's Enter): fills the segment cache and writes renders/preview_<seq>.mp4 for exact playback in the monitor."""
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); proj = copy.deepcopy(load_project())
-    return start_render(proj, seq_id, dict(PREVIEW_PRESET, incremental=True, loudnorm=False), f"preview_{seq_id}", body.get("actor", "human"))
+    """Render a saved sequence or In–Out range to a unique, revision-bound file."""
+    body = await req.json(); seq_id = body.get("sequence", "seq1"); proj, context = preview_state(body)
+    request_id = body.get("request_id")
+    if request_id is not None and (not isinstance(request_id, str) or not 8 <= len(request_id) <= 80 or not all(c.isalnum() or c == "-" for c in request_id)):
+        raise HTTPException(422, "Invalid preview request identity.")
+    ranged = bool(body.get("range", False)); preset = dict(PREVIEW_PRESET, range=ranged)
+    existing = existing_preview_request(request_id, context, seq_id, ranged)
+    if existing: return existing
+    report = await asyncio.to_thread(check_render_resources, proj, seq_id, preset)
+    try: binding = await asyncio.to_thread(preview_binding, proj, context, seq_id, ranged)
+    except ValueError as error: raise HTTPException(422, str(error))
+    # Recheck after slow source inspection and queue while owning project identity.
+    with LOCK:
+        require_project_context({"_context": context}, active_id(), load_project())
+        existing = existing_preview_request(request_id, context, seq_id, ranged)
+        if existing: return existing
+        return start_render(proj, seq_id, preset, "preview_" + uuid.uuid4().hex,
+                            body.get("actor", "human"), report, preview=binding, request_id=request_id)
 
 @app.post("/api/render_all")
 async def render_all(req: Request):
     """Export every sequence in the project with one preset (batch)."""
-    body = await req.json(); preset = body.get("preset", {}); proj = copy.deepcopy(load_project()); jobs = []
-    for sq in proj["sequences"]:
-        if sq.get("multicam") or sq.get("merged"): continue
-        name = "".join(ch for ch in sq["name"] if ch.isalnum() or ch in "-_ ").strip().replace(" ", "_") or sq["id"]; jobs.append(start_render(proj, sq["id"], preset, f"{body.get('prefix', 'batch')}_{name}", body.get("actor", "human")))
+    body = await req.json(); preset = body.get("preset", {}); proj, context = preview_state(body); jobs = []
+    sequences = [sq for sq in proj["sequences"] if not sq.get("multicam") and not sq.get("merged")]
+    reports = [await asyncio.to_thread(check_export_resources, proj, sq["id"], preset) for sq in sequences]
+    preview_state({"_context": context})
+    for sq, report in zip(sequences, reports):
+        name = "".join(ch for ch in sq["name"] if ch.isalnum() or ch in "-_ ").strip().replace(" ", "_") or sq["id"]; jobs.append(start_render(proj, sq["id"], preset, f"{body.get('prefix', 'batch')}_{name}", body.get("actor", "human"), report, context=context))
     return {"jobs": jobs}
 
 # ---------- interpret footage / extract audio ----------
+async def _interpretation_candidate(body):
+    import source_interpretation
+    project, expected = _workflow_capture(body)
+    for key in ("actor", "client"):
+        if key in body and (not isinstance(body[key], str) or not body[key].strip() or len(body[key]) > 120):
+            raise HTTPException(422, "Interpretation actor/client must be nonempty text of at most 120 characters")
+    owner_root, owner_tasks = os.path.abspath(ROOT), TASKS
+    project_file = P("projects", expected["project"], "project.json")
+    try:
+        candidate = await _owned_render_thread(source_interpretation.inspect, project, body, scratch_parent=owner_root)
+        await asyncio.to_thread(source_interpretation.check, candidate["resources"])
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(422, str(error)) from error
+    with LOCK: require_project_context({"_context":expected}, active_id(), load_project())
+    planned = candidate["plan"]
+    report = {"context":expected, **{key:planned[key] for key in ("ok", "kind", "media_id", "requested_media_id", "settings", "affected_media_ids", "issues", "summary", "fingerprint")}}
+    return {**candidate, "project":project, "expected":expected, "report":report,
+        "owner_root":owner_root, "owner_tasks":owner_tasks, "project_file":project_file}
+
+
+async def _commit_source_interpretation(candidate, body, envelope):
+    import source_interpretation
+    import source_commands
+    project, expected, planned = candidate["project"], candidate["expected"], candidate["plan"]
+    await asyncio.to_thread(source_interpretation.check, candidate["resources"])
+    _source_command_policy(body)
+    result = await _workflow_commit(project, expected, {**envelope, "message":planned["summary"]["message"]}, "interpret", body.get("actor", "human"))
+    preparation = {"tasks":[], "warnings":[]}
+    for identity in planned["prepare_ids"]:
+        try:
+            if os.path.abspath(ROOT) != candidate["owner_root"] or TASKS is not candidate["owner_tasks"]:
+                raise ValueError("Workspace changed; open the original workspace and Prepare its interpreted sources")
+            await asyncio.to_thread(source_interpretation.check, candidate["resources"])
+            if os.path.abspath(ROOT) != candidate["owner_root"] or TASKS is not candidate["owner_tasks"]:
+                raise ValueError("Workspace changed during source validation; prepare previews from the original workspace")
+            media = project["media"][identity]
+            prepared = source_commands.alias_source(project, media) if media.get("audio_alias") else media
+            if not _task_media_current({"media_id":identity, "path":prepared["path"], "token":prepared["ingest_token"],
+                    "project_file":candidate["project_file"], "info":prepared}):
+                raise ValueError("The interpreted source changed before preparation")
+            queued = finish_ingest(identity, prepared["path"], prepared, candidate["project_file"], prepared["ingest_token"])
+            if queued.get("error"): raise ValueError(queued["error"])
+            preparation["tasks"].append({"media_id":identity, "task":queued})
+        except Exception as error:
+            preparation["warnings"].append("Source "+identity+" saved; preparation could not be queued: "+str(error)[:300])
+    result["preparation"] = preparation
+    result["warnings"] = [*result["warnings"], *preparation["warnings"]]
+    return result
+
+
+@app.post("/api/media/interpret/review")
+async def media_interpret_review(req: Request):
+    return (await _interpretation_candidate(await req.json()))["report"]
+
+
 @app.post("/api/media/interpret")
 async def media_interpret(req: Request):
-    """Interpret Footage: assume a frame rate for a media file (e.g. 60 → 30 for 2× slow motion). {media_id, fps|null}"""
     body = await req.json()
-    with LOCK:
-        proj = load_project(); m = proj["media"].get(body["media_id"])
-        if not m: raise HTTPException(404)
-        fps = body.get("fps"); native = float(m.get("native_fps") or m.get("fps") or 0)
-        if not native: raise HTTPException(400, "media has no frame rate")
-        m["native_fps"] = native
-        if fps: m["interpret_fps"] = float(fps); m["duration"] = float(m.get("native_duration") or m["duration"]) * native / float(fps); m.setdefault("native_duration", float(m.get("native_duration") or m["duration"] * float(fps) / native))
-        else: m.pop("interpret_fps", None); m["duration"] = float(m.get("native_duration") or m["duration"])
-        save_project(proj)
-    ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": [m["id"]], "interpret_fps": fps}); await broadcast(ev); return m
+    if not isinstance(body, dict) or not isinstance(body.get("fingerprint"), str) or len(body["fingerprint"]) != 64 or any(c not in "0123456789abcdef" for c in body["fingerprint"]):
+        raise HTTPException(400, "Interpretation requires the exact reviewed fingerprint and saved context; review it first")
+    _source_command_policy(body)
+    candidate = await _interpretation_candidate(body); planned = candidate["plan"]
+    if body["fingerprint"] != planned["fingerprint"]: raise HTTPException(409, "The reviewed interpretation changed; review the saved source again")
+    if not planned["ok"]: raise HTTPException(422, candidate["report"])
+    summary = planned["summary"]
+    envelope = {"kind":"source_interpretation", "project":candidate["expected"]["project"], "changed":bool(planned["ops"]),
+        "summary":summary, "warnings":summary["warnings"], "media_id":planned["media_id"], "requested_media_id":planned["requested_media_id"],
+        "affected_media_ids":planned["affected_media_ids"], "media":planned["media"][planned["media_id"]]}
+    _source_command_policy(body)
+    if not planned["ops"]:
+        with LOCK: require_project_context({"_context":candidate["expected"]}, active_id(), load_project())
+        return {"ok":True, **envelope, "context":candidate["expected"], "preparation":{"tasks":[],"warnings":[]}}
+    try:
+        apply_ops(candidate["project"], planned["ops"])
+        parse_project(json.dumps(candidate["project"], allow_nan=False).encode("utf-8"))
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, str(error)) from error
+    commit = asyncio.create_task(_commit_source_interpretation(candidate, body, envelope))
+    try: return await asyncio.shield(commit)
+    except asyncio.CancelledError:
+        while not commit.done():
+            try: await asyncio.shield(commit)
+            except asyncio.CancelledError: continue
+            except Exception: break
+        if not commit.cancelled(): commit.exception()
+        raise
 
 def fit_hook_text(txt, size, W):
     """Wrap a headline into two balanced lines and shrink it so the longest line fits ~90% of the frame width."""
@@ -1022,94 +2551,100 @@ async def markers_note(req: Request):
 
 @app.post("/api/sequences/variants")
 async def sequence_variants(req: Request):
-    """Hook variants for ad testing: {sequence, hooks:[text…], layer_match?: 'hook'} → N duplicate sequences, each with the hook card's
-    headline replaced (any graphic layer whose text equals the current hook, or the first text layer of a graphic named 'Hook')."""
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); hooks = [h for h in body.get("hooks", []) if str(h).strip()]
-    if not hooks: raise HTTPException(400, "give at least one hook text")
-    with LOCK:
-        proj = load_project(); base = next(x for x in proj["sequences"] if x["id"] == seq_id); made = []
-        for i, h in enumerate(hooks):
-            sq = copy.deepcopy(base); sq["id"] = f"{seq_id}_v{i + 1}_{uuid.uuid4().hex[:4]}"; sq["name"] = f"{base['name']} — V{i + 1}: {h[:28]}"; sq["variant_of"] = seq_id; sq["variant_hook"] = h; replaced = 0
-            for t in sq["tracks"]:
-                for c in t["clips"]:
-                    g = c.get("graphic")
-                    if g and (g.get("name", "").lower().startswith("hook") or c.get("note", "").lower().startswith("hook")):
-                        for L in g["layers"]:
-                            if L.get("kind") == "text": L["text"], L["size"] = fit_hook_text(h, int(L.get("size", 150)), sq["width"]); replaced += 1; break
-                    elif c.get("title") and c.get("note", "").lower().startswith("hook"): c["title"]["text"] = h; replaced += 1
-            if not replaced:  # fall back: the first text layer in the first graphic
-                for t in sq["tracks"]:
-                    for c in t["clips"]:
-                        if c.get("graphic"):
-                            for L in c["graphic"]["layers"]:
-                                if L.get("kind") == "text": L["text"] = h; replaced = 1; break
-                        if replaced: break
-                    if replaced: break
-            sq["captions"] = [dict(cp, text=h) if cp.get("text") == base.get("variant_hook") else cp for cp in (sq.get("captions") or [])]
-            proj["sequences"].append(sq); made.append({"id": sq["id"], "name": sq["name"], "replaced": replaced})
-        save_project(proj)
-    ev = log_event({"type": "project_replaced", "actor": body.get("actor", "human"), "source": "variants", "made": made}); await broadcast(ev); return {"variants": made}
+    return await _queue_recipe_workflow(await req.json(), "variants")
 
 @app.get("/api/sequence/describe")
-def sequence_describe(sequence: str = "seq1"):
-    """A human-readable account of the cut: sections (from duration markers), every clip with timing, what it is, notes and animations,
-    captions, audio beds, and QA-relevant totals. Feeds the Info panel and gives agents a whole-cut summary in one call."""
-    proj = load_project(); seq = next((x for x in proj["sequences"] if x["id"] == sequence), None)
-    if not seq: raise HTTPException(404)
-    media = proj["media"]; total = max([c["start"] + (c["out"] - c["in_"]) / max(c.get("speed", 1), 1e-6) for t in seq["tracks"] for c in t["clips"]] + [0]); lines = [f"# {seq['name']} — {total:.2f}s, {seq['width']}x{seq['height']} @ {seq['fps']:g}"]
-    secs = [m for m in (seq.get("markers") or []) if m.get("duration")]
-    if secs: lines.append("Sections: " + "; ".join(f"{m['name']} {m['time']:.2f}–{m['time'] + m['duration']:.2f}s ({m['duration']:.2f}s)" for m in sorted(secs, key=lambda m: m["time"])))
-    for t in sorted(seq["tracks"], key=lambda t: (t["kind"] != "video", -t["index"] if t["kind"] == "video" else t["index"])):
-        if not t["clips"]: continue
-        lines.append(f"## {t['id']} ({t['kind']})")
-        for c in sorted(t["clips"], key=lambda c: c["start"]):
-            d = (c["out"] - c["in_"]) / max(c.get("speed", 1), 1e-6); m = media.get(c.get("media_id") or "")
-            what = m["name"] if m else ("text: " + (c["title"].get("text") or "")[:40] if c.get("title") else f"graphic: {c['graphic'].get('name', '')} ({len(c['graphic'].get('layers', []))} layers)" if c.get("graphic") else "nested" if c.get("sequence_id") else "adjustment" if c.get("adjustment") else "?")
-            extras = []
-            if c.get("transition_in"): extras.append(f"in: {c['transition_in']['type']} {c['transition_in'].get('duration', 0):.2f}s")
-            if c.get("speed") not in (None, 1, 1.0): extras.append(f"speed {c['speed']:g}x")
-            if (c.get("color") or {}).get("lut"): extras.append("look " + os.path.basename(c["color"]["lut"]))
-            if c.get("fx_stack"): extras.append("fx " + ",".join(f["type"] for f in c["fx_stack"] if f.get("enabled") is not False))
-            if c.get("keyframes"): extras.append("keyframed " + ",".join(k.split(".")[-1] for k in c["keyframes"]))
-            if c.get("graphic"): extras.append("anim " + ",".join(sorted({(L.get("anim_in") or {}).get("type", "") for L in c["graphic"]["layers"] if (L.get("anim_in") or {}).get("type")})))
-            lines.append(f"- {c['start']:.2f}–{c['start'] + d:.2f}s ({d:.2f}s) {what}" + (f" [{'; '.join(extras)}]" if extras else "") + (f" — {c['note']}" if c.get("note") else ""))
-    if seq.get("captions"): lines.append("## Captions"); lines += [f"- {cp['start']:.2f}–{cp['end']:.2f}s “{cp['text']}”" for cp in seq["captions"]]
-    return {"text": "\n".join(lines), "duration": round(total, 2), "clips": sum(len(t["clips"]) for t in seq["tracks"]), "sections": secs}
+def sequence_describe(sequence: str = "", workspace: str = "", project: str = "", revision: str = ""):
+    """Owned read of canonical timeline seconds and containing-frame addresses."""
+    import source_commands
+    if not all((sequence, workspace, project, revision)): raise HTTPException(400, "Sequence description requires sequence and saved workspace/project/revision")
+    document, expected = _workflow_capture({"_context": {"workspace": workspace, "project": project, "revision": revision}})
+    try: result = source_commands.describe(document, sequence)
+    except (ValueError, KeyError, TypeError) as error: raise HTTPException(422, str(error)) from error
+    with LOCK: require_project_context({"_context": expected}, active_id(), load_project())
+    return {"ok": True, **result, "context": expected, "project": expected["project"]}
 
 @app.get("/api/renders/manifest")
 def renders_manifest():
     """Deliverables sheet: every finished render with file, sequence, preset and QA — JSON (and CSV via ?fmt=csv)."""
-    rows = [{"name": j["name"], "file": j.get("out"), "sequence": j.get("sequence"), "status": j["status"], "finished": j.get("finished"), **{f"qa_{k}": v for k, v in (j.get("qa") or {}).items() if k != "flags"}, "flags": "; ".join((j.get("qa") or {}).get("flags") or [])} for j in JOBS.values() if j["status"] == "done"]
+    rows = [{"job_id": j["id"], "name": j["name"], "file": j.get("out"), "sequence": j.get("sequence"), "status": j["status"], "finished": j.get("finished"), **{f"qa_{k}": v for k, v in (j.get("qa") or {}).items() if k != "flags"}, "flags": "; ".join((j.get("qa") or {}).get("flags") or [])} for j in JOBS.values() if j["status"] == "done"]
     return rows
 
-REVIEW_HTML = """<!doctype html><meta charset="utf-8"><title>Review — {name}</title><style>body{{margin:0;background:#111;color:#eee;font:14px system-ui}} .wrap{{max-width:960px;margin:0 auto;padding:16px}} video{{width:100%;max-height:70vh;background:#000}} .c{{display:flex;gap:8px;margin:10px 0}} input,textarea{{flex:1;background:#1c1c1f;color:#eee;border:1px solid #333;border-radius:4px;padding:8px}} button{{background:#2d8ceb;color:#fff;border:0;border-radius:4px;padding:8px 14px;cursor:pointer}} .note{{padding:8px;border-left:3px solid #f6c14a;margin:6px 0;background:#18181b}} .t{{color:#9a9a9a;font-family:monospace;margin-right:8px;cursor:pointer}}</style>
-<div class="wrap"><h2>{name}</h2><video id="v" src="{src}" controls playsinline></video><div class="c"><input id="who" placeholder="your name" value="client"><textarea id="txt" rows="2" placeholder="comment at the current time…"></textarea><button id="send">Add note</button></div><div id="list"></div></div>
-<script>const v=document.getElementById('v');const fmt=t=>{{const m=Math.floor(t/60),s=(t%60).toFixed(1);return m+':'+String(s).padStart(4,'0')}};async function load(){{const r=await fetch('/api/review/{name}/notes');const j=await r.json();document.getElementById('list').innerHTML=j.map(n=>`<div class="note"><span class="t" onclick="v.currentTime=${{n.time}}">${{fmt(n.time)}}</span><b>${{n.author}}</b> ${{n.text}}</div>`).join('')}}
-document.getElementById('send').onclick=async()=>{{const txt=document.getElementById('txt').value.trim();if(!txt)return;await fetch('/api/review/{name}/notes',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{time:v.currentTime,text:txt,author:document.getElementById('who').value||'client'}})}});document.getElementById('txt').value='';load()}};load();</script>"""
+REVIEW_HTML = """<!doctype html><meta charset="utf-8"><title>Review — {name}</title>
+<style>body{{margin:0;background:#111;color:#eee;font:14px system-ui}} .wrap{{max-width:960px;margin:auto;padding:16px}} video{{width:100%;max-height:70vh;background:#000}} .c{{display:flex;gap:8px;margin:10px 0;flex-wrap:wrap}} input,textarea{{flex:1;background:#1c1c1f;color:#eee;border:1px solid #777;border-radius:4px;padding:8px}} button{{background:#246dcc;color:#fff;border:0;border-radius:4px;padding:8px 14px;cursor:pointer}} .note{{padding:8px;border-left:3px solid #f6c14a;margin:6px 0;background:#18181b}} .t{{margin-right:8px}}</style>
+<div class="wrap" id="review" data-ref="{ref}"><h2>{name}</h2><video id="v" src="{src}" controls playsinline></video><div class="c"><input id="who" aria-label="Your name" value="client"><textarea id="txt" rows="2" aria-label="Comment at the current time"></textarea><button id="send">Add note</button></div><p id="reviewStatus" role="status" aria-live="polite"></p><div id="list"></div></div>
+<script src="/static/review.js?v=1"></script>"""
+
+
+def review_job(reference):
+    with RENDER_STATE_LOCK:
+        if reference.startswith("job-"):
+            job = JOBS.get(reference[4:])
+            candidates = [job] if job and job.get("status") == "done" else []
+        else:
+            candidates = [job for job in JOBS.values() if job.get("name") == reference and job.get("status") == "done"]
+        if not candidates: raise HTTPException(404, "No completed export exists for this review.")
+        if len(candidates) != 1: raise HTTPException(409, "Several exports use this name. Open the review link for the intended job.")
+        return copy.deepcopy(candidates[0])
+
+
+def review_project(job):
+    # Caller owns LOCK. Review comments must never follow the active-project
+    # pointer into a different library/sequence with the same document IDs.
+    captured = job.get("context") or (job.get("preview") or {}).get("context")
+    if not captured: raise HTTPException(409, "This older export has no project identity. Export a new review version.")
+    if captured.get("workspace") != workspace_id(ROOT) or captured.get("project") != active_id():
+        raise HTTPException(409, "Open the original project in Filmocity to read or add review notes.")
+    project = load_project()
+    sequence = next((s for s in project["sequences"] if s["id"] == job.get("sequence")), None)
+    if sequence is None: raise HTTPException(409, "The reviewed sequence no longer exists in this project.")
+    return project, sequence
+
 
 @app.get("/review/{name}")
 def review_page(name: str):
-    """Client review page for a finished render: the video with time-stamped comments that land as note markers in the sequence."""
-    j = next((x for x in JOBS.values() if x["name"] == name and x["status"] == "done"), None)
-    if not j: raise HTTPException(404, "no finished render with that name")
-    return HTMLResponse(REVIEW_HTML.format(name=name, src=j["out"]))
+    from html import escape
+    job = review_job(name)
+    return HTMLResponse(REVIEW_HTML.format(name=escape(job["name"]), src=escape(job["out"], quote=True), ref=escape("job-" + job["id"], quote=True)))
+
 
 @app.get("/api/review/{name}/notes")
 def review_notes(name: str):
-    j = next((x for x in JOBS.values() if x["name"] == name), None); seq_id = (j or {}).get("sequence", "seq1"); proj = load_project(); seq = next((x for x in proj["sequences"] if x["id"] == seq_id), None)
-    return [m for m in ((seq or {}).get("markers") or []) if m.get("type") == "note" and m.get("review") == name]
+    job = review_job(name)
+    with LOCK:
+        _, sequence = review_project(job)
+        return copy.deepcopy([m for m in sequence.get("markers", []) if m.get("type") == "note" and
+                              (m.get("review_job") == job["id"] or (not job.get("review_url") and not m.get("review_job") and m.get("review") == job["name"]))])
+
 
 @app.post("/api/review/{name}/notes")
 async def review_note_add(name: str, req: Request):
-    body = await req.json(); j = next((x for x in JOBS.values() if x["name"] == name), None); seq_id = (j or {}).get("sequence", "seq1")
+    body = await req.json(); job = review_job(name)
+    try: position = float(body.get("time", 0))
+    except (TypeError, ValueError): raise HTTPException(422, "Review time must be a finite, nonnegative number.")
+    if not math.isfinite(position) or position < 0: raise HTTPException(422, "Review time must be a finite, nonnegative number.")
     with LOCK:
-        proj = load_project(); seq = next(x for x in proj["sequences"] if x["id"] == seq_id); mk = {"id": uuid.uuid4().hex[:6], "time": round(float(body.get("time", 0)), 3), "duration": 0, "name": str(body.get("text", ""))[:300], "type": "note", "color": "yellow", "author": str(body.get("author", "client"))[:40], "review": name, "resolved": False, "ts": time.time()}
-        seq["markers"] = (seq.get("markers") or []) + [mk]; save_project(proj); si = proj["sequences"].index(seq)
-    ev = log_event({"type": "ops", "actor": mk["author"], "tool": "review", "reason": f"review note: {mk['name'][:60]}", "ops": [{"op": "set", "path": f"/sequences/{si}/markers", "value": seq["markers"]}]}); await broadcast({k: v for k, v in ev.items() if k != "befores"}); return mk
+        proj, seq = review_project(job); pid = active_id(); before = copy.deepcopy(proj)
+        mk = {"id": uuid.uuid4().hex[:8], "time": position + job.get("review_start", 0), "review_time": position, "duration": 0,
+              "name": str(body.get("text", ""))[:300], "type": "note", "color": "yellow",
+              "author": str(body.get("author", "client"))[:40], "review": job["name"],
+              "review_job": job["id"], "resolved": False, "ts": time.time()}
+        seq["markers"] = (seq.get("markers") or []) + [mk]; si = proj["sequences"].index(seq)
+        ops = [{"op": "set", "path": f"/sequences/{si}/markers", "value": copy.deepcopy(seq["markers"])}]
+        event = {"type": "ops", "actor": mk["author"], "tool": "review", "reason": "review note", "ops": ops, "project": pid}
+        warning = commit_edit(before, proj, pid, {"ops": ops, "actor": mk["author"], "reason": "review note", "ts": time.time()})
+        LAST_OPS_TS["t"] = time.time()
+        try: event = log_event(event, project_id=pid)
+        except Exception as error: warning = (str(warning) + "; " if warning else "") + "Note saved, but audit recording failed: " + str(error)[:200]
+    try: await broadcast({k: v for k, v in event.items() if k != "befores"})
+    except Exception as error: warning = (str(warning) + "; " if warning else "") + "Note saved, but editor notification failed: " + str(error)[:200]
+    return {**mk, **({"warning": str(warning)} if warning else {})}
 
 @app.post("/api/install/whisper")
 async def install_whisper():
     """Install faster-whisper into the running Python (venv) for auto-captions and transcripts; returns when done."""
+    if getattr(sys, "frozen", False):
+        return {"ok": False, "message": "This packaged build cannot install speech tools in place. Use the source installer with --with-whisper. A packaged speech-enabled build requires separate dependency and native testing."}
     def run(): return subprocess.run([sys.executable, "-m", "pip", "install", "-q", "faster-whisper"], capture_output=True, text=True, timeout=1800)
     r = await asyncio.to_thread(run)
     try:
@@ -1119,195 +2654,171 @@ async def install_whisper():
 
 @app.post("/api/recipes/talking_head")
 async def recipe_talking_head(req: Request):
-    """Talking-head clip: {sequence, clip_id, silences: bool, punch_every: s, voice_preset: bool, captions: bool, broll: [media_id…]}.
-    Removes silences (ripple), adds alternating punch-ins, applies Voice Clean-up, word-pop captions from the transcript when available,
-    and lays b-roll shots over the middle of the speech on the track above."""
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); cid = body["clip_id"]
-    with LOCK:
-        proj = load_project(); seq = next(x for x in proj["sequences"] if x["id"] == seq_id); tr = next(t for t in seq["tracks"] for c in t["clips"] if c["id"] == cid); c = next(x for x in tr["clips"] if x["id"] == cid); m = proj["media"].get(c.get("media_id"))
-    if not m or not m.get("has_audio"): raise HTTPException(400, "select a clip with audio")
-    ops = []; removed = 0.0; pieces = [(c["in_"], c["out"])]
-    if body.get("silences", True):
-        src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m; total = float(m["duration"]); env, rate = await asyncio.to_thread(_envelope, src["path"], min(3600, int(total) + 1), 50)
-        import math as _m; db = [20 * _m.log10(max(e, 1e-6)) for e in env]; ref = max(db) if db else 0; gaps = []; start = None
-        for i, v in enumerate(db):
-            quiet = v < ref - 38
-            if quiet and start is None: start = i / rate
-            elif not quiet and start is not None:
-                if i / rate - start >= 0.45: gaps.append((start + 0.08, i / rate - 0.08))
-                start = None
-        gaps = [g for g in gaps if g[1] > c["in_"] and g[0] < c["out"] and g[1] - g[0] > 0.05]; cur = c["in_"]; pieces = []
-        for a, b_ in gaps:
-            if min(b_, c["out"]) - max(cur, c["in_"]) > 0.04 and a > cur: pieces.append((max(cur, c["in_"]), min(a, c["out"])))
-            cur = max(cur, b_)
-        if c["out"] - cur > 0.04: pieces.append((cur, c["out"]))
-        if not pieces: pieces = [(c["in_"], c["out"])]
-    sp = c.get("speed", 1) or 1; end0 = c["start"] + (c["out"] - c["in_"]) / sp; t = c["start"]; new_clips = []
-    fxp = json.load(open(os.path.join(ASSETS, "presets", "effect_presets.json"))).get("Voice — Clean-up", {}) if body.get("voice_preset", True) else {}
-    ops.append({"op": "remove_clip", "sequence": seq_id, "track": tr["id"], "clip_id": cid})
-    for i, (a, b_) in enumerate(pieces):
-        nc = copy.deepcopy(c); nc.update(id=cid if i == 0 else uuid.uuid4().hex[:8], start=round(t, 4), in_=round(a, 4), out=round(b_, 4), note=(c.get("note", "") + " · " if c.get("note") else "") + f"speech {i + 1}/{len(pieces)}")
-        if fxp: nc["afx_stack"] = copy.deepcopy(fxp.get("afx_stack", []))
-        d = (b_ - a) / sp; every = float(body.get("punch_every", 3) or 3); kf = []; tt = 0.0; k = 0
-        while tt < d: kf.append({"t": round(tt, 3), "v": 1.12 if (k + i) % 2 else 1.0, "e": "hold"}); tt += every; k += 1
-        if body.get("punch_every", 3): nc["keyframes"] = {**(nc.get("keyframes") or {}), "transform.scale": kf}
-        if i: nc["transition_in"] = None
-        ops.append({"op": "set_clip", "sequence": seq_id, "track": tr["id"], "clip": nc}); new_clips.append(nc); t += d
-    removed = (end0 - c["start"]) - (t - c["start"])
-    for t2 in seq["tracks"]:
-        for x in t2["clips"]:
-            if x["id"] != cid and x["start"] >= end0 - 1e-6: ops.append({"op": "set_clip", "sequence": seq_id, "track": t2["id"], "clip": {"id": x["id"], "start": round(x["start"] - removed, 4)}})
-    # b-roll over the middle third of each speech piece, on the track above
-    broll = [proj["media"].get(x) for x in body.get("broll", []) if proj["media"].get(x)]
-    if broll:
-        vts = sorted([x for x in seq["tracks"] if x["kind"] == "video"], key=lambda x: x["index"]); above = next((x for x in vts if x["index"] > tr["index"]), None)
-        if above:
-            for i, nc in enumerate(new_clips):
-                bm = broll[i % len(broll)]; d = (nc["out"] - nc["in_"]) / sp
-                if d < 1.5: continue
-                bd = min(2.2, d * 0.5, float(bm["duration"]) - 0.2); bs = nc["start"] + (d - bd) / 2
-                ops.append({"op": "set_clip", "sequence": seq_id, "track": above["id"], "clip": {"id": uuid.uuid4().hex[:8], "media_id": bm["id"], "start": round(bs, 3), "in_": round(max(0.0, (float(bm["duration"]) - bd) / 2), 3), "out": round(max(0.0, (float(bm["duration"]) - bd) / 2) + bd, 3), "speed": 1, "fit": "cover" if (bm.get("width") or 0) <= (bm.get("height") or 1) else "blur_fill", "audio": {"gain_db": -60, "linked": False}, "transition_in": {"type": "dissolve", "duration": 0.25}, "transition_out": {"type": "dissolve", "duration": 0.25}, "keyframes": {"transform.scale": [{"t": 0, "v": 1.0}, {"t": round(bd, 3), "v": 1.06, "e": "ease"}]}, "note": "b-roll over speech"}})
-    with LOCK:
-        proj = load_project(); befores = apply_ops(proj, ops); warnings = normalize_tracks(proj); si = proj["sequences"].index(next(x for x in proj["sequences"] if x["id"] == seq_id))
-        if body.get("captions", True):
-            seq = proj["sequences"][si]; caps = seq.get("captions") or []
-            if seq.get("transcript"):
-                words = [w for w in seq["transcript"] if any(nc["start"] <= w["s"] < nc["start"] + (nc["out"] - nc["in_"]) / sp for nc in new_clips)]; block = []; bstart = None
-                for w in words:
-                    if bstart is None: bstart = w["s"]
-                    block.append(w["w"])
-                    if len(" ".join(block)) > 34 or w["w"].endswith((".", "?", "!")): caps.append({"id": uuid.uuid4().hex[:6], "start": round(bstart, 2), "end": round(w["e"], 2), "text": " ".join(block)}); block = []; bstart = None
-                if block: caps.append({"id": uuid.uuid4().hex[:6], "start": round(bstart, 2), "end": round(words[-1]["e"], 2), "text": " ".join(block)})
-                seq["captions"] = caps
-            seq["caption_style"] = {**(seq.get("caption_style") or {}), "animate": "pop", "size": int(seq["height"] * 0.037), "borderw": 5, "y": 0.62}
-        save_project(proj)
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "recipe_talking_head", "reason": f"talking head: {len(pieces)} speech pieces, −{removed:.2f}s silence, {len(broll)} b-roll", "ops": ops, "befores": befores, "warnings": warnings}); await broadcast({k: v for k, v in ev.items() if k != "befores"})
-    return {"ok": True, "pieces": len(pieces), "removed": round(removed, 2), "broll": len(broll)}
+    return await _queue_recipe_workflow(await req.json(), "talking_head")
+
+async def _queue_recipe_workflow(body, mode):
+    import recipe_workflow as recipe
+    project, expected = _workflow_capture(body)
+    if TASKS is None: raise HTTPException(503, "Background tasks are unavailable")
+    try:
+        import re
+        if not isinstance(body.get("request_id"), str) or not re.fullmatch("[a-f0-9]{32}", body["request_id"]): raise ValueError("Supply a unique recipe request_id")
+        payload = await asyncio.to_thread(recipe.capture, project, body, mode, expected, ROOT, ASSETS)
+        with LOCK:
+            require_project_context({"_context": expected}, active_id(), load_project())
+            task = TASKS.submit("recipe", {"talking_head": "Talking Head", "reel": "New Reel", "explainer": "Explainer", "variants": "Hook Variants"}[mode], expected, payload, identity=body["request_id"])
+    except (TaskError, ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(400, str(error)) from error
+    return {"ok": True, "task": task, "context": expected, "message": "Recipe queued. Review its complete plan before applying."}
+
+def _task_recipe_workflow(payload, task):
+    import recipe_workflow
+    return recipe_workflow.analyze(payload, task)
+
+def _review_recipe_workflow(value, project, expected):
+    import recipe_workflow as recipe
+    if value["record"]["kind"] != "recipe" or value["record"]["status"] != "ready" or value.get("result") is None:
+        raise HTTPException(409, "This recipe is not ready for review")
+    try: plan = recipe.review(project, value["payload"], value["result"], expected, value["record"]["id"], ROOT, ASSETS)
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(409, str(error)) from error
+    return {"ok": True, "task": value["record"], "context": expected, "result": value["result"], "plan": plan}
+
+@app.post("/api/tasks/{identity}/recipe")
+async def background_recipe_review(identity: str, req: Request):
+    value = _owned_task(identity); project, expected = _workflow_capture(await req.json())
+    reviewed = await asyncio.to_thread(_review_recipe_workflow, value, project, expected)
+    _workflow_capture({"_context": expected})
+    if _owned_task(identity)["record"]["status"] != "ready": raise HTTPException(409, "This recipe is no longer ready")
+    return reviewed
+
+async def _apply_recipe_workflow(identity, value, body, project, expected):
+    import recipe_workflow as recipe
+    for sequence in project.get("sequences", []):
+        if sequence.get("workflow", {}).get("recipe_tasks", {}).get(identity):
+            TASKS.finish_apply(identity, success=True, message="Recipe already applied")
+            return {"ok": True, "context": expected, "sequence": sequence["id"], "message": "Recipe already applied; no changes repeated"}
+    _audio_edit_policy(body)
+    reviewed = await asyncio.to_thread(_review_recipe_workflow, value, project, expected); plan = reviewed["plan"]
+    if not isinstance(body.get("fingerprint"), str) or body["fingerprint"] != plan["fingerprint"]:
+        raise HTTPException(409, "The recipe review changed; review the plan again before applying")
+    _workflow_capture({"_context": expected})
+    if not plan["ops"]: return {"ok": True, "context": expected, "changed": False, "message": "The recipe has no changes to apply"}
+    try: TASKS.begin_apply(identity)
+    except (TaskError, OSError) as error: raise HTTPException(409, str(error)) from error
+    try:
+        await _owned_render_thread(recipe.publish, value["payload"], value["result"], identity)
+        await asyncio.to_thread(recipe.validate_current, project, value["payload"], expected, ROOT, ASSETS)
+        apply_ops(project, plan["ops"])
+        sequence = next(s for s in project["sequences"] if s["id"] == plan["summary"]["sequence"])
+        sequence.setdefault("workflow", {}).setdefault("recipe_tasks", {})[identity] = {"fingerprint": plan["fingerprint"], "mode": value["payload"]["mode"]}
+        parse_project(json.dumps(project, allow_nan=False).encode("utf-8"))
+        response = await _workflow_commit(project, expected, plan["summary"], "recipe", body.get("actor", "human"))
+    except BaseException:
+        TASKS.finish_apply(identity, success=False, message="Recipe apply was not confirmed. Inspect the project and Recovery before retrying.")
+        raise
+    task = TASKS.finish_apply(identity, success=True, message="Recipe applied")
+    if task.get("warning"): response["warning"] = (response.get("warning", "") + "; " + task["warning"]).strip("; ")
+    return response
 
 @app.post("/api/audio/duck_all")
 async def duck_all(req: Request):
-    """Auto-duck: every clip on music-tagged tracks (or the given track) dips by `amount` dB while any dialogue clip plays. {sequence, music_track?, amount, fade}"""
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); amount = float(body.get("amount", -12)); fade = float(body.get("fade", 0.35))
+    """Review/apply/remove additive music attenuation from audible clip spans."""
+    import audio_ducking
+    from project_lifecycle import COPY_WORKER, ProjectActionError
+    body = await req.json(); project, expected = _workflow_capture(body)
+    if type(body.get("preview", False)) is not bool: raise HTTPException(400, "Preview must be true or false")
+    try:
+        after, summary = await COPY_WORKER.run(lambda check: audio_ducking.build(project, body, check))
+    except ProjectActionError as error: raise HTTPException(409, str(error)) from error
+    except (ValueError, TypeError, KeyError) as error: raise HTTPException(400, str(error)) from error
     with LOCK:
-        proj = load_project(); seq = next(x for x in proj["sequences"] if x["id"] == seq_id); media = proj["media"]
-        dialogue = []
-        for t in seq["tracks"]:
-            for c in t["clips"]:
-                m = media.get(c.get("media_id") or "")
-                if m and m.get("has_audio") and (c.get("audio_tag") == "dialogue" or (t["kind"] == "video" and (c.get("audio") or {}).get("linked") is not False and not c.get("audio_tag"))): dialogue.append((c["start"], c["start"] + (c["out"] - c["in_"]) / max(c.get("speed", 1), 1e-6)))
-        dialogue.sort(); ops = []; n = 0
-        for t in seq["tracks"]:
-            if t["kind"] != "audio": continue
-            if body.get("music_track") and t["id"] != body["music_track"]: continue
-            for c in t["clips"]:
-                m = media.get(c.get("media_id") or "")
-                if not m or (c.get("audio_tag") not in (None, "music")) or (body.get("music_track") is None and not (m.get("has_audio") and not m.get("has_video"))): continue
-                base = float((c.get("audio") or {}).get("gain_db", 0) or 0); cs, ce = c["start"], c["start"] + (c["out"] - c["in_"]) / max(c.get("speed", 1), 1e-6); kf = [{"t": 0.0, "v": base}]
-                for ds, de in dialogue:
-                    a, b_ = max(cs, ds), min(ce, de)
-                    if b_ - a <= 0.2: continue
-                    kf += [{"t": round(max(0, a - cs - fade), 3), "v": base}, {"t": round(a - cs, 3), "v": base + amount, "e": "ease"}, {"t": round(b_ - cs, 3), "v": base + amount}, {"t": round(min(ce - cs, b_ - cs + fade), 3), "v": base, "e": "ease"}]
-                if len(kf) > 1:
-                    kf = sorted({k["t"]: k for k in kf}.values(), key=lambda k: k["t"]); ops.append({"op": "set_clip", "sequence": seq_id, "track": t["id"], "clip": {"id": c["id"], "keyframes": {**(c.get("keyframes") or {}), "audio.gain_db": kf}}}); n += 1
-        befores = apply_ops(proj, ops); save_project(proj)
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "duck_all", "reason": f"auto-duck {n} music clip(s) under dialogue", "ops": ops, "befores": befores}); await broadcast({k: v for k, v in ev.items() if k != "befores"}); return {"ducked": n, "dialogue_spans": len(dialogue)}
+        require_project_context({"_context": expected}, active_id(), load_project())
+        if not body.get("preview") and body.get("preview_plan") is not None and body["preview_plan"] != summary["plan"]:
+            raise HTTPException(409, "The ducking choices or saved edit changed. Review the plan again.")
+        if body.get("preview") or not summary["ducked"]:
+            return {"ok": True, **summary, "context": expected, "preview": bool(body.get("preview"))}
+        if body.get("actor", "human") != "human":
+            try:
+                with open(P("settings.json"), encoding="utf-8") as stream: settings = json.load(stream)
+            except FileNotFoundError: settings = {}
+            if settings.get("agent_mode") == "proposals_only": raise HTTPException(403, "Direct agent edits are disabled; ask the editor to review ducking.")
+    return await _workflow_commit(after, expected, summary, "ducking", body.get("actor", "human"))
 
 @app.post("/api/recipes/cover")
 async def recipe_cover(req: Request):
-    """Cover / thumbnail: {sequence, time, headline, sub?, template?, sizes:[[1080,1920],[1280,720]]} → PNGs of the frame at `time` with a
-    premium headline card (brand kit applied), one per size. For Reels covers and YouTube thumbnails."""
-    from render import render_frame
-    import re as _re
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); t = float(body.get("time", 1.0)); proj = copy.deepcopy(load_project()); seq = next(x for x in proj["sequences"] if x["id"] == seq_id)
-    b = {"primary": "#E8631C", "secondary": "#7A2E9E", "text": "#FFFFFF", "font": "", **(proj.get("brand") or {})}
-    def walk(v):
-        if isinstance(v, str): return _re.sub(r"\{\{(primary|secondary|text|font)\}\}", lambda m: b.get(m.group(1), ""), v)
-        if isinstance(v, list): return [walk(x) for x in v]
-        if isinstance(v, dict): return {k: walk(x) for k, x in v.items() if not (k == "font" and walk(x) == "")}
-        return v
-    tp = templates().get(body.get("template") or "Hook — Big Statement"); outs = []
-    os.makedirs(P("renders"), exist_ok=True)
-    for (w, h) in body.get("sizes") or [[seq["width"], seq["height"]]]:
-        sq = copy.deepcopy(seq); sq["id"] = "cover"; sq["captions"] = []; sq["markers"] = []
-        # drop graphics/titles at the chosen time (the card replaces them), keep the footage
-        for tr in sq["tracks"]:
-            if tr["kind"] == "video": tr["clips"] = [c for c in tr["clips"] if c.get("media_id")]
-        layers = walk(json.loads(json.dumps(tp["layers"]))) if tp else []
-        for L in layers:
-            L.pop("anim_in", None); L.pop("anim_out", None)
-            if L.get("kind") == "text" and L.get("text", "").startswith("STOP"): L["text"], L["size"] = fit_hook_text(body.get("headline", "Stop scrolling."), int(L.get("size", 150)), sq["width"])
-            elif L.get("kind") == "text": L["text"] = body.get("sub", "")
-        top = sorted([x for x in sq["tracks"] if x["kind"] == "video"], key=lambda x: -x["index"])[0]
-        top["clips"].append({"id": "coverc", "media_id": None, "start": max(0.0, t - 0.5), "in_": 0, "out": 1.5, "speed": 1, "graphic": {"name": "Cover", "layers": layers}, "transform": {"opacity": 1}, "keyframes": {}})
-        proj2 = copy.deepcopy(proj); proj2["sequences"] = [sq]; name = f"cover_{seq_id}_{w}x{h}.png"; out = P("renders", name)
-        if (w, h) != (sq["width"], sq["height"]):
-            sq["width"], sq["height"] = w, h  # re-fit: the frame renders at the new canvas size; footage that no longer matches the aspect gets blur-fill
-            for tr in sq["tracks"]:
-                for c in tr["clips"]:
-                    if c.get("media_id"): c["fit"] = "blur_fill"
-        try: await asyncio.to_thread(render_frame, proj2, "cover", t, out)
-        except Exception as e: raise HTTPException(500, f"cover failed: {e}")
-        outs.append(f"/renders/{name}")
-    return {"covers": outs}
+    import cover_workflow as cover
+    import re
+    body = await req.json(); project, expected = _workflow_capture(body)
+    if TASKS is None: raise HTTPException(503, "Background tasks are unavailable")
+    try:
+        if not isinstance(body.get("request_id"), str) or not re.fullmatch("[a-f0-9]{32}", body["request_id"]): raise ValueError("Supply a unique cover request_id")
+        payload = await asyncio.to_thread(cover.capture, project, body, expected, ROOT, ASSETS)
+        with LOCK:
+            require_project_context({"_context": expected}, active_id(), load_project())
+            task = TASKS.submit("cover", "Cover / Thumbnail", expected, payload, identity=body["request_id"])
+    except (TaskError, ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(400, str(error)) from error
+    return {"ok": True, "task": task, "context": expected, "message": "Cover queued. Review and download its owned PNGs from Tasks."}
+
+def _task_cover_workflow(payload, task):
+    import cover_workflow
+    return cover_workflow.analyze(payload, task)
+
+def _review_cover_workflow(value, project, expected):
+    import cover_workflow as cover
+    if value["record"]["kind"] != "cover" or value["record"]["status"] != "ready" or value.get("result") is None:
+        raise HTTPException(409, "This cover is not ready for review")
+    try: plan = cover.review(project, value["payload"], value["result"], expected, value["record"]["id"], ROOT, ASSETS)
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(409, str(error)) from error
+    return {"ok": True, "task": value["record"], "context": expected, "result": value["result"], "plan": plan}
+
+@app.post("/api/tasks/{identity}/cover")
+async def background_cover_review(identity: str, req: Request):
+    value = _owned_task(identity); project, expected = _workflow_capture(await req.json())
+    reviewed = await asyncio.to_thread(_review_cover_workflow, value, project, expected)
+    _workflow_capture({"_context": expected})
+    if _owned_task(identity)["record"]["status"] != "ready": raise HTTPException(409, "This cover is no longer ready")
+    return reviewed
+
+@app.get("/api/tasks/{identity}/cover/{index}")
+async def background_cover_image(identity: str, index: int, workspace: str, project: str, revision: str = None, download: bool = False):
+    import cover_workflow as cover
+    value = _owned_task(identity)
+    owner = value["record"]["context"]
+    if workspace != owner["workspace"] or project != owner["project"]: raise HTTPException(409, "Cover download belongs to another project or workspace")
+    with LOCK:
+        captured = copy.deepcopy(load_project()); expected = project_context(ROOT, active_id(), captured)
+        if revision is not None: require_project_context({"_context": {"workspace": workspace, "project": project, "revision": revision}}, active_id(), captured)
+    await asyncio.to_thread(_review_cover_workflow, value, captured, expected)
+    covers = value["result"]["covers"]
+    if type(index) is not int or not 0 <= index < len(covers): raise HTTPException(404, "Cover output not found")
+    # Read the verified bounded PNG before responding; a switched project or
+    # replaced path cannot be served later by a deferred FileResponse open.
+    def read_png():
+        path = cover.verify_result(value["payload"], value["result"], identity)[index]
+        with path.open("rb") as stream: data = stream.read(min(cover.MAX_OUTPUT_BYTES, covers[index]["size"]) + 1)
+        import hashlib
+        if len(data) != covers[index]["size"] or hashlib.sha256(data).hexdigest() != covers[index]["sha256"]: raise ValueError("Cover changed before download")
+        return data
+    try: data = await asyncio.to_thread(read_png)
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(409, str(error)) from error
+    _workflow_capture({"_context": expected})
+    if _owned_task(identity)["record"]["status"] != "ready": raise HTTPException(409, "This cover is no longer available")
+    headers = {"Cache-Control": "no-store", "Content-Disposition": ('attachment' if download else 'inline') + '; filename="' + covers[index]["filename"] + '"'}
+    return Response(content=data, media_type="image/png", headers=headers)
 
 @app.post("/api/recipes/explainer")
 async def recipe_explainer(req: Request):
-    """Long-form dressing: {sequence, lower_third:{name, role}, chapters: bool, end_card: text}. Adds a lower third at the start, a
-    Chapter Title card at every chapter marker (numbered, from the marker names), and a CTA end card at the end — brand kit applied."""
-    import re as _re
-    body = await req.json(); seq_id = body.get("sequence", "seq1")
-    with LOCK:
-        proj = load_project(); seq = next(x for x in proj["sequences"] if x["id"] == seq_id); b = {"primary": "#E8631C", "secondary": "#7A2E9E", "text": "#FFFFFF", "font": "", **(proj.get("brand") or {})}
-        def walk(v):
-            if isinstance(v, str): return _re.sub(r"\{\{(primary|secondary|text|font)\}\}", lambda m: b.get(m.group(1), ""), v)
-            if isinstance(v, list): return [walk(x) for x in v]
-            if isinstance(v, dict): return {k: walk(x) for k, x in v.items() if not (k == "font" and walk(x) == "")}
-            return v
-        tpls = templates(); vts = sorted([x for x in seq["tracks"] if x["kind"] == "video"], key=lambda x: x["index"])
-        while len(vts) < 3:  # cards live above the footage: chapters on the second video track, lower third + end card on the third
-            nt = {"id": f"V{len(vts) + 1}", "kind": "video", "index": len(vts) + 1, "clips": []}; seq["tracks"].append(nt); vts.append(nt)
-        chap_tr, card_tr = vts[1], vts[2]; total = max([c["start"] + (c["out"] - c["in_"]) / max(c.get("speed", 1), 1e-6) for t in seq["tracks"] for c in t["clips"]] + [0]); ops = []
-        lt = body.get("lower_third")
-        if lt and tpls.get("Lower Third — Card"):
-            layers = walk(json.loads(json.dumps(tpls["Lower Third — Card"]["layers"]))); texts = [L for L in layers if L.get("kind") == "text"]
-            if texts: texts[0]["text"] = lt.get("name", "")
-            if len(texts) > 1: texts[1]["text"] = lt.get("role", "")
-            ops.append({"op": "set_clip", "sequence": seq_id, "track": card_tr["id"], "clip": {"id": uuid.uuid4().hex[:8], "media_id": None, "start": float(lt.get("at", 1.0)), "in_": 0, "out": min(4.5, max(1.0, total - 3.5 - float(lt.get("at", 1.0)))), "speed": 1, "graphic": {"name": "Lower third", "layers": layers}, "transform": {"opacity": 1}, "keyframes": {}, "note": "lower third"}})
-        if body.get("chapters", True) and tpls.get("Chapter Title"):
-            chs = sorted([m for m in (seq.get("markers") or []) if m.get("type") in ("chapter", "comment") and m.get("name")], key=lambda m: m["time"])
-            for i, m in enumerate(chs):
-                layers = walk(json.loads(json.dumps(tpls["Chapter Title"]["layers"]))); texts = [L for L in layers if L.get("kind") == "text"]
-                if texts: texts[0]["text"] = f"{i + 1:02d}"
-                if len(texts) > 1: texts[1]["text"] = m["name"]
-                nxt = chs[i + 1]["time"] if i + 1 < len(chs) else total; d = max(0.8, min(3.0, nxt - m["time"] - 0.1, (total - 3.2 - m["time"]) if body.get("end_card") else 3.0))
-                ops.append({"op": "set_clip", "sequence": seq_id, "track": chap_tr["id"], "clip": {"id": uuid.uuid4().hex[:8], "media_id": None, "start": round(m["time"], 3), "in_": 0, "out": round(d, 3), "speed": 1, "graphic": {"name": f"Chapter {i + 1}", "layers": layers}, "transform": {"opacity": 1}, "keyframes": {}, "note": f"chapter card: {m['name']}"}})
-        if body.get("end_card") and tpls.get("CTA — Follow"):
-            layers = walk(json.loads(json.dumps(tpls["CTA — Follow"]["layers"])))
-            for L in layers:
-                if L.get("kind") == "text": L["text"] = body["end_card"]
-            ops.append({"op": "set_clip", "sequence": seq_id, "track": card_tr["id"], "clip": {"id": uuid.uuid4().hex[:8], "media_id": None, "start": round(max(0.0, total - 3.0), 3), "in_": 0, "out": 3.0, "speed": 1, "graphic": {"name": "End card", "layers": layers}, "transform": {"opacity": 1}, "keyframes": {}, "note": "end card"}})
-        befores = apply_ops(proj, ops); warnings = normalize_tracks(proj); save_project(proj)
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "recipe_explainer", "reason": f"explainer dressing: {len(ops)} cards", "ops": ops, "befores": befores, "warnings": warnings}); await broadcast({k: v for k, v in ev.items() if k != "befores"}); return {"ok": True, "cards": len(ops)}
+    return await _queue_recipe_workflow(await req.json(), "explainer")
 
 @app.get("/api/projects/recent")
 def projects_recent():
-    """Recent projects (most recently updated first) for the File menu."""
-    out = []
-    for pid in (os.listdir(P("projects")) if os.path.isdir(P("projects")) else []):
-        f = P("projects", pid, "project.json")
-        if os.path.exists(f):
-            try: j = json.load(open(f)); out.append({"id": pid, "name": j.get("name", pid), "updated": j.get("updated", os.path.getmtime(f)), "sequences": len(j.get("sequences", [])), "media": len(j.get("media", {}))})
-            except Exception: pass
-    return sorted(out, key=lambda x: -x["updated"])[:12]
+    return projects_list()[:12]
 
 @app.post("/api/projects/duplicate")
 async def projects_duplicate(req: Request):
-    """Duplicate the active project (project file, snapshots and training history stay with the original) as a new project and switch to it."""
-    body = await req.json(); name = body.get("name") or None
-    with LOCK:
-        proj = load_project(); pid = str(uuid.uuid4())[:8]; os.makedirs(P("projects", pid), exist_ok=True); cp = copy.deepcopy(proj); cp["id"] = pid; cp["name"] = name or (proj.get("name", "Untitled") + " copy"); cp["proposals"] = []
-        json.dump(cp, open(P("projects", pid, "project.json"), "w"), indent=1); json.dump({"id": pid}, open(P("active.json"), "w"))
-    ev = log_event({"type": "project_replaced", "actor": body.get("actor", "human"), "source": "duplicate", "project": pid}); await broadcast(ev); return {"id": pid, "name": cp["name"]}
+    """Copy the saved edit; original snapshots/training/undo remain with the original."""
+    body = await req.json(); document, expected, pid = _prepare_project_action(body, "duplicate")
+    result, event = _commit_prepared_project(document, expected, pid, body.get("actor", "human"), "duplicate")
+    return await _project_action_notify(result, event)
 
 @app.get("/api/media/usage")
 def media_usage(media_id: str):
@@ -1321,122 +2832,36 @@ def media_usage(media_id: str):
 
 @app.get("/api/cache")
 def cache_info():
-    """Sizes of the regenerable caches (proxies, thumbnails, segment cache, template previews) and the renders folder."""
-    def size(d): return round(sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(d) for f in fs) / 1e6, 1) if os.path.isdir(d) else 0.0
-    return {"proxies_mb": size(P("proxies")), "thumbs_mb": size(P("thumbs")), "segments_mb": size(P("renders", "cache")), "renders_mb": size(P("renders")) - size(P("renders", "cache")), "sfx_mb": size(P("sfx"))}
+    """Framework worker scans captured workspace caches without blocking HTTP."""
+    from cache_operations import inspect, CacheBusy
+    try: return inspect(ROOT)
+    except CacheBusy as error: raise HTTPException(429, str(error)) from error
 
 @app.post("/api/cache/clear")
 async def cache_clear(req: Request):
-    """Clear regenerable caches: {what: 'segments'|'proxies'|'thumbs'|'all'}. Proxies and thumbnails regenerate on demand."""
-    body = await req.json(); what = body.get("what", "segments"); cleared = []
-    for key, d in (("segments", P("renders", "cache")), ("proxies", P("proxies")), ("thumbs", P("thumbs", "tpl"))):
-        if what in (key, "all") and os.path.isdir(d):
-            for f in os.listdir(d):
-                try: os.remove(os.path.join(d, f))
-                except OSError: pass
-            cleared.append(key)
-    if "proxies" in cleared:
-        with LOCK:
-            proj = load_project()
-            for m in proj["media"].values(): m.pop("proxy", None)
-            save_project(proj)
-    return {"cleared": cleared, **cache_info()}
+    """The owned worker retains cleanup results even if its request is cancelled."""
+    from cache_operations import clear, CacheBusy
+    body = await req.json()
+    if not isinstance(body, dict): raise HTTPException(422, "Choose a known cache category")
+    try: return await clear(ROOT, body.get("what", "segments"))
+    except CacheBusy as error: raise HTTPException(409, str(error)) from error
+    except ValueError as error: raise HTTPException(422, str(error)) from error
 
 @app.post("/api/recipes/reel")
 async def recipe_reel(req: Request):
-    """New Reel: {shots:[media_id…], music: media_id|null, target: seconds, hook: text, cta: text, captions: bool, look: lut path|null, sequence}.
-    Builds a 9:16 cut: hook card (premium template), shots cut on the music's downbeats (or evenly), blur-fill framing for landscape
-    shots, a light push-in on each, the music bed remixed to length with ducking, a CTA end card, whooshes under cuts, brand kit applied."""
-    import re as _re
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); target = float(body.get("target", 15)); shots = [m for m in body.get("shots", [])]
-    if not shots: raise HTTPException(400, "pick at least one shot")
-    with LOCK:
-        proj = load_project(); seq = next(x for x in proj["sequences"] if x["id"] == seq_id); media = proj["media"]; b = {"primary": "#E8631C", "secondary": "#7A2E9E", "text": "#FFFFFF", "font": "", **(proj.get("brand") or {})}
-        W, H = seq["width"], seq["height"]; vtracks = sorted([t for t in seq["tracks"] if t["kind"] == "video"], key=lambda t: t["index"]); atracks = sorted([t for t in seq["tracks"] if t["kind"] == "audio"], key=lambda t: t["index"])
-        v1, v2 = vtracks[0], (vtracks[1] if len(vtracks) > 1 else vtracks[0]); a_music = atracks[-1] if atracks else None; a_sfx = atracks[0] if atracks else None
-        def walk(v):
-            if isinstance(v, str): return _re.sub(r"\{\{(primary|secondary|text|font)\}\}", lambda m: b.get(m.group(1), ""), v)
-            if isinstance(v, list): return [walk(x) for x in v]
-            if isinstance(v, dict): return {k: walk(x) for k, x in v.items() if not (k == "font" and walk(x) == "")}
-            return v
-        tpls = templates()
-        # timing: cut points from the music's downbeats when available, else even shares
-        hook_d = 1.6 if body.get("hook") else 0.0; cta_d = 2.2 if body.get("cta") else 0.0; body_d = max(2.0, target - hook_d - cta_d)
-        cuts = []
-        mus = media.get(body.get("music")) if body.get("music") else None
-        if mus:
-            try:
-                src = media[mus["subclip_of"]] if mus.get("subclip_of") else mus; beat, phase = _beats(src["path"], min(600, int(mus["duration"]) + 1)); bar = beat * 4; t = phase
-                while t < body_d + bar: cuts.append(t); t += bar
-                cuts = [c for c in cuts if 1.2 <= c <= body_d - 1.0] or []  # no cut in the first 1.2 s or the last second
-            except Exception: cuts = []
-        n = len(shots); bounds = [0.0]
-        if cuts and len(cuts) >= n - 1:
-            step = max(1, len(cuts) // max(1, n - 1)); bounds += cuts[step - 1::step][:n - 1]
-        else: bounds += [body_d * i / n for i in range(1, n)]
-        bounds.append(body_d); ops = []; t = hook_d
-        for i, mid in enumerate(shots):
-            m = media.get(mid)
-            if not m: continue
-            d = max(0.4, bounds[i + 1] - bounds[i]); avail = max(0.2, float(m["duration"]) - 0.2); d = min(d, avail); in_ = max(0.0, (float(m["duration"]) - d) / 2)
-            landscape = (m.get("width") or W) > (m.get("height") or H)
-            clip = {"id": uuid.uuid4().hex[:8], "media_id": mid, "start": round(t, 3), "in_": round(in_, 3), "out": round(in_ + d, 3), "speed": 1, "fit": "blur_fill" if landscape else "cover", "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "audio": {"gain_db": -3, "linked": True}, "keyframes": {"transform.scale": [{"t": 0, "v": 1.0}, {"t": round(d, 3), "v": 1.08, "e": "ease"}]}, "color": {"lut": body.get("look")} if body.get("look") else {}, "note": f"reel shot {i + 1}/{n}" + (" on the downbeat" if cuts else "")}
-            if i > 0: clip["transition_in"] = {"type": "dip_black" if i % 3 == 2 else "dissolve", "duration": 0.25}
-            ops.append({"op": "set_clip", "sequence": seq_id, "track": v1["id"], "clip": clip}); t += d
-        end_t = t
-        if body.get("hook"):
-            tp = tpls.get("Hook — Big Statement"); layers = walk(json.loads(json.dumps(tp["layers"])))
-            for L in layers:
-                if L.get("kind") == "text" and L.get("text", "").startswith("STOP"): L["text"], L["size"] = fit_hook_text(body["hook"], int(L.get("size", 150)), W)
-                elif L.get("kind") == "text": L["text"] = body.get("hook_sub", "")
-            ops.append({"op": "set_clip", "sequence": seq_id, "track": v2["id"], "clip": {"id": uuid.uuid4().hex[:8], "media_id": None, "start": 0.0, "in_": 0, "out": round(hook_d + 0.6, 3), "speed": 1, "graphic": {"name": "Hook", "layers": layers}, "transform": {"opacity": 1}, "keyframes": {}, "note": "hook card"}})
-        if body.get("cta"):
-            tp = tpls.get("CTA — Follow"); layers = walk(json.loads(json.dumps(tp["layers"])))
-            for L in layers:
-                if L.get("kind") == "text": L["text"] = body["cta"]
-            ops.append({"op": "set_clip", "sequence": seq_id, "track": v2["id"], "clip": {"id": uuid.uuid4().hex[:8], "media_id": None, "start": round(max(0.0, end_t - 0.3), 3), "in_": 0, "out": round(cta_d + 0.3, 3), "speed": 1, "graphic": {"name": "CTA", "layers": layers}, "transform": {"opacity": 1}, "keyframes": {}, "note": "CTA end card"}})
-            end_t += cta_d
-        if mus and a_music:
-            ml = float(mus["duration"]); segs = [{"in": 0.0, "out": min(ml, end_t)}]
-            if ml > end_t + 1.0:
-                try: segs = json.loads(json.dumps((await audio_remix_segments(mus, end_t))))
-                except Exception: pass
-            st = 0.0
-            for i, sg in enumerate(segs):
-                remaining = end_t - st
-                if remaining <= 0.2: break
-                out_ = min(sg["out"], sg["in"] + remaining)  # the bed ends exactly with the picture
-                ops.append({"op": "set_clip", "sequence": seq_id, "track": a_music["id"], "clip": {"id": uuid.uuid4().hex[:8], "media_id": mus["id"], "start": round(st, 3), "in_": sg["in"], "out": round(out_, 3), "speed": 1, "audio": {"gain_db": -10, "linked": True, "fade_out": 0.8 if (i == len(segs) - 1 or out_ < sg["out"]) else 0}, "audio_transition_in": {"type": "constant_power", "duration": 0.4} if i else None, "note": "music bed"}}); st += out_ - sg["in"]
-                if out_ < sg["out"]: break
-        if body.get("captions", True) and body.get("hook"): seq_caps = [{"id": uuid.uuid4().hex[:6], "start": round(hook_d + 0.2, 2), "end": round(min(end_t, hook_d + 2.6), 2), "text": body.get("caption_text") or body["hook"]}]; ops.append({"op": "set", "path": f"/sequences/{proj['sequences'].index(seq)}/captions", "value": (seq.get("captions") or []) + seq_caps})
-        if body.get("caption_style"): ops.append({"op": "set", "path": f"/sequences/{proj['sequences'].index(seq)}/caption_style", "value": walk(body["caption_style"])})
-        secs = ([{"id": uuid.uuid4().hex[:6], "time": 0.0, "duration": round(hook_d, 2), "name": "Hook", "type": "section", "color": "green"}] if hook_d else []) + [{"id": uuid.uuid4().hex[:6], "time": round(hook_d, 2), "duration": round(t - hook_d, 2), "name": "Body", "type": "section", "color": "blue"}] + ([{"id": uuid.uuid4().hex[:6], "time": round(t, 2), "duration": round(cta_d, 2), "name": "CTA", "type": "section", "color": "orange"}] if cta_d else [])
-        ops.append({"op": "set", "path": f"/sequences/{proj['sequences'].index(seq)}/markers", "value": (seq.get("markers") or []) + secs})
-        befores = apply_ops(proj, ops); warnings = normalize_tracks(proj); save_project(proj)
-    # whooshes under the cuts (generated sfx) — done after the lock since ingest touches the project
-    if body.get("sfx", True) and a_sfx:
-        try:
-            m = await media_sfx_internal("whoosh"); cuts_t = [o["clip"]["start"] for o in ops if o["op"] == "set_clip" and o.get("track") == v1["id"] and o["clip"].get("transition_in")]
-            sops = [{"op": "set_clip", "sequence": seq_id, "track": a_sfx["id"], "clip": {"id": uuid.uuid4().hex[:8], "media_id": m["id"], "start": round(max(0.0, ct - 0.2), 3), "in_": 0, "out": m["duration"], "speed": 1, "audio": {"gain_db": -8, "linked": True}, "note": "whoosh under cut"}} for ct in cuts_t]
-            with LOCK:
-                proj = load_project(); apply_ops(proj, sops); normalize_tracks(proj); save_project(proj)
-            ops += sops
-        except Exception: pass
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "recipe_reel", "reason": f"reel: {len(shots)} shots, {'beat-cut' if cuts else 'even'}, hook={'yes' if body.get('hook') else 'no'}", "ops": ops, "befores": befores, "warnings": warnings}); await broadcast({k: v for k, v in ev.items() if k != "befores"})
-    return {"ok": True, "duration": round(end_t, 2), "beat_cut": bool(cuts), "clips": len(ops)}
+    return await _queue_recipe_workflow(await req.json(), "reel")
 
-async def audio_remix_segments(m, target):
-    proj = load_project(); src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m; total = float(m["duration"])
-    env, rate = await asyncio.to_thread(_envelope, src["path"], min(600, int(total) + 1), 50)
-    on = [max(0.0, env[i] - env[i - 1]) for i in range(1, len(env))]; best, bestlag = -1, int(rate * 60 / 120)
-    for lag in range(int(rate * 60 / 180), int(rate * 60 / 60) + 1):
-        s_ = sum(on[i] * on[i - lag] for i in range(lag, len(on)))
-        if s_ > best: best, bestlag = s_, lag
-    beat = bestlag / rate; phrase = beat * 16; bestp = 0.0
-    cut = total - target; remove = max(1, int(round(cut / phrase))) * phrase
-    if remove > total * 0.8: remove = phrase * max(1, int((total * 0.8) // phrase))
-    start_rm = bestp + phrase * max(1, int(((total - bestp) / phrase) // 3)); end_rm = min(total - phrase, start_rm + remove)
-    return [{"in": 0.0, "out": round(start_rm, 3)}, {"in": round(end_rm, 3), "out": total}]
+async def audio_remix_segments(m, target, project=None):
+    """Bounded recipe ranges from its captured project, never the active project."""
+    import audio_remix as remix
+    if project is None: raise ValueError("Recipe remix needs its captured project")
+    import media_analysis
+    captured = copy.deepcopy(project)
+    current = captured.get("media", {}).get(m.get("id"))
+    if current != m: raise ValueError("The recipe source changed")
+    media_analysis.source_inputs(captured, m["id"])
+    intervals, _ = remix.design(float(m["duration"]), target)
+    return [{"in": begin, "out": end} for begin, end in intervals]
 
 async def media_sfx_internal(kind):
     d = P("sfx"); os.makedirs(d, exist_ok=True); f = os.path.join(d, f"{kind}.wav")
@@ -1447,52 +2872,144 @@ async def media_sfx_internal(kind):
             if m.get("sfx") == kind: return m
         mid, m = await asyncio.to_thread(ingest, f, f"SFX {kind}"); m["sfx"] = kind; proj["media"][mid] = m; save_project(proj); return m
 
+def _source_command_policy(body):
+    for key in ("actor", "client"):
+        if key in body and (not isinstance(body[key], str) or not body[key].strip() or len(body[key]) > 120):
+            raise HTTPException(422, "Editorial actor/client must be a nonempty string of at most 120 characters")
+    if body.get("actor", "human") == "human": return
+    try:
+        with open(P("settings.json"), encoding="utf-8") as stream: mode = json.load(stream).get("agent_mode") or "direct"
+    except FileNotFoundError: mode = "direct"
+    except (OSError, ValueError, TypeError, AttributeError) as error: raise HTTPException(403, "Could not read agent editing preferences") from error
+    if mode == "proposals_only": raise HTTPException(403, "Direct agent edits are disabled; submit a proposal or ask the editor to run this command")
+
+
+async def _commit_source_creation(candidate, body, envelope):
+    import source_creation_io
+    import source_commands
+    project, expected, planned = candidate["project"], candidate["expected"], candidate["plan"]
+    await asyncio.to_thread(source_creation_io.check, candidate["resources"])
+    _source_command_policy(body)
+    result = await _workflow_commit(project, expected, {**envelope, "message":planned["summary"]["message"]}, "import", body.get("actor", "human"))
+    preparation = {"tasks":[], "warnings":[]}
+    # A saved registration owns each following queue attempt, even when the
+    # request disappears. Never bind a late attempt to another workspace.
+    for identity in planned["prepare_ids"]:
+        try:
+            if os.path.abspath(ROOT) != candidate["owner_root"] or TASKS is not candidate["owner_tasks"]:
+                raise ValueError("Workspace changed; open the original workspace and explicitly Prepare the saved media")
+            await asyncio.to_thread(source_creation_io.check, candidate["resources"])
+            if os.path.abspath(ROOT) != candidate["owner_root"] or TASKS is not candidate["owner_tasks"]:
+                raise ValueError("Workspace changed during source validation; prepare the saved media from its original workspace")
+            media = project["media"][identity]
+            prepared = source_commands.alias_source(project, media) if media.get("audio_alias") else media
+            if not _task_media_current({"media_id":identity, "path":prepared["path"], "token":prepared["ingest_token"],
+                    "project_file":candidate["project_file"], "info":prepared}):
+                raise ValueError("The saved item or its physical source changed before preparation")
+            queued = finish_ingest(identity, prepared["path"], prepared, candidate["project_file"], prepared["ingest_token"])
+            if queued.get("error"): raise ValueError(queued["error"])
+            preparation["tasks"].append({"media_id":identity, "task":queued})
+        except Exception as error:
+            preparation["warnings"].append("Media "+identity+" saved; preparation could not be queued: "+str(error)[:300])
+    result["preparation"] = preparation
+    result["warnings"] = [*result["warnings"], *preparation["warnings"]]
+    return result
+
+
+async def _source_creation_command(body, mode):
+    import source_creation_io
+    project, expected = _workflow_capture(body); _source_command_policy(body)
+    owner_root, owner_tasks = os.path.abspath(ROOT), TASKS
+    project_file = P("projects", expected["project"], "project.json")
+    try:
+        candidate = await _owned_render_thread(source_creation_io.prepare, project, body, mode,
+            identity=uuid.uuid4().hex, added=time.time(), scratch_parent=owner_root)
+        planned = candidate["plan"]; summary = planned["summary"]
+        envelope = {"kind":"source_creation", "mode":mode, "project":expected["project"], "changed":bool(planned["ops"]),
+            "media_ids":planned["media_ids"], "media":planned["media"], "summary":summary, "warnings":summary.get("warnings",[])}
+        _source_command_policy(body)
+        if not planned["ops"]:
+            with LOCK: require_project_context({"_context":expected}, active_id(), load_project())
+            return {"ok":True, **envelope, "context":expected, "preparation":{"tasks":[],"warnings":[]}}
+        apply_ops(project, planned["ops"])
+        parse_project(json.dumps(project, allow_nan=False).encode("utf-8"))
+    except (ValueError, KeyError, TypeError, OSError) as error: raise HTTPException(422, str(error)) from error
+    candidate.update(project=project, expected=expected, owner_root=owner_root, owner_tasks=owner_tasks, project_file=project_file)
+    commit = asyncio.create_task(_commit_source_creation(candidate, body, envelope))
+    try: return await asyncio.shield(commit)
+    except asyncio.CancelledError:
+        while not commit.done():
+            try: await asyncio.shield(commit)
+            except asyncio.CancelledError: continue
+            except Exception: break
+        if not commit.cancelled(): commit.exception()
+        raise
+
+
+async def _commit_editorial_source(project, expected, envelope, mode, body, prepared, owner_root, owner_tasks, project_file):
+    # Complete an accepted registration and its queue attempt even if the HTTP
+    # reply is lost. This owned coroutine is joined by the request wrapper.
+    action = "import" if mode == "extract_audio" else mode
+    result = await _workflow_commit(project, expected, {**envelope, "message": envelope["summary"]["message"]}, action, body.get("actor", "human"))
+    if mode == "extract_audio":
+        try:
+            if os.path.abspath(ROOT) != owner_root or TASKS is not owner_tasks:
+                raise ValueError("Workspace changed; open the alias's workspace and explicitly prepare its preview")
+            if not _task_media_current({"media_id":prepared["id"], "path":prepared["path"], "token":prepared["ingest_token"], "project_file":project_file, "info":prepared}):
+                raise ValueError("The saved alias or its physical source changed before preparation")
+            queued = finish_ingest(prepared["id"], prepared["path"], prepared, project_file, prepared["ingest_token"])
+            result["preparation"] = {"warning": queued["error"]} if queued.get("error") else {"task": queued}
+        except Exception as error:
+            result["preparation"] = {"warning": "Audio alias saved; preparation could not be queued: " + str(error)[:300]}
+        if result["preparation"].get("warning"): result["warnings"] = [*result["warnings"], result["preparation"]["warning"]]
+    return result
+
+
+async def _editorial_source_command(body, mode):
+    import source_commands
+    project, expected = _workflow_capture(body); _source_command_policy(body)
+    owner_root, owner_tasks = os.path.abspath(ROOT), TASKS
+    project_file = P("projects", expected["project"], "project.json")
+    try:
+        planned = await asyncio.to_thread(source_commands.plan, project, body, mode,
+            identity=uuid.uuid4().hex, token=uuid.uuid4().hex, added=time.time())
+        summary = planned["summary"]; summary.setdefault("warnings", [])
+        envelope = {"changed": bool(planned["ops"]), "summary": summary, "warnings": summary["warnings"], "project": expected["project"]}
+        if mode == "split_words": envelope.update(sequence=summary["sequence"], clip_id=summary["clip_id"], layers=planned["layers"])
+        elif mode == "input_transform": envelope.update(media=planned["media"], **{key:summary[key] for key in ("requested_media_id","media_id","affected_media_ids","scope")})
+        else: envelope.update(media=planned["media"], media_id=planned["media"]["id"], id=planned["media"]["id"], name=planned["media"]["name"], source_media_id=summary["source_media_id"])
+        await asyncio.to_thread(source_commands.check_resources, planned["resources"])
+        _source_command_policy(body)
+        if not planned["ops"]:
+            with LOCK: require_project_context({"_context": expected}, active_id(), load_project())
+            return {"ok": True, **envelope, "context": expected}
+        apply_ops(project, planned["ops"])
+        parse_project(json.dumps(project, allow_nan=False).encode("utf-8"))
+    except (ValueError, KeyError, TypeError, OSError) as error: raise HTTPException(422, str(error)) from error
+    # Import receipts keep late derived metadata compatible with one Undo.
+    commit = asyncio.create_task(_commit_editorial_source(project, expected, envelope, mode, body,
+        planned.get("prepared"), owner_root, owner_tasks, project_file))
+    try: return await asyncio.shield(commit)
+    except asyncio.CancelledError:
+        while not commit.done():
+            try: await asyncio.shield(commit)
+            except asyncio.CancelledError: continue
+            except Exception: break
+        if not commit.cancelled(): commit.exception()  # Observe any failure without abandoning saved work.
+        raise
+
+
 @app.post("/api/graphics/split_words")
 async def graphics_split_words(req: Request):
-    """Kinetic typography: split a text layer into one layer per word with exact pixel offsets (PIL metrics of the render font), each
-    inheriting the style and given a staggered animation. {sequence, clip_id, layer, anim:{type,duration,ease}, stagger}"""
-    from PIL import ImageFont
-    from render import font_file, seq_total
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); cid = body["clip_id"]; li = int(body.get("layer", 0)); an = body.get("anim") or {"type": "pop", "duration": 0.35, "ease": "back_out"}; stagger = float(body.get("stagger", 0.12))
-    with LOCK:
-        proj = load_project(); seq = next(x for x in proj["sequences"] if x["id"] == seq_id); tr = next(t for t in seq["tracks"] for c in t["clips"] if c["id"] == cid); c = next(x for x in tr["clips"] if x["id"] == cid)
-        g = c.get("graphic"); L = g["layers"][li]
-        if L.get("kind") != "text": raise HTTPException(400, "layer is not text")
-        size = int(L.get("size", seq["height"] * 0.05)); font = ImageFont.truetype(font_file(L.get("font"), L.get("weight", "bold")), size); words = str(L.get("text", "")).split(); space = font.getlength(" ")
-        widths = [font.getlength(w) for w in words]; total = sum(widths) + space * (len(words) - 1); W = seq["width"]
-        align = L.get("align", "center"); x0 = {"center": -total / 2, "left": 0.0, "right": -total}[align if align in ("center", "left", "right") else "center"]  # offsets relative to the layer's anchor
-        # anchor the words as left-aligned pieces positioned from the original alignment point
-        base_x = {"center": W / 2, "left": W * 0.06, "right": W * 0.94}[align if align in ("center", "left", "right") else "center"] + float(L.get("x", 0))
-        new_layers = []; cx = base_x + x0; full_top = font.getbbox(" ".join(words))[1] if words else 0
-        for i, (w, ww) in enumerate(zip(words, widths)):
-            wl = {k: v for k, v in L.items() if k not in ("anim_in", "anim_out")}; wl.update(text=w, align="left", x=round(cx - W * 0.06, 1), baseline_dy=int(font.getbbox(w)[1] - full_top), anim_in={**an, "delay": round(float((L.get("anim_in") or {}).get("delay", 0) or 0) + i * stagger, 3)}, word_of=li)
-            if L.get("anim_out"): wl["anim_out"] = {**L["anim_out"], "delay": round(float(L["anim_out"].get("delay", 0) or 0) + (len(words) - 1 - i) * stagger * 0.5, 3)}
-            new_layers.append(wl); cx += ww + space
-        g["layers"] = g["layers"][:li] + new_layers + g["layers"][li + 1:]; save_project(proj)
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "kinetic", "reason": f"split into {len(new_layers)} words", "ops": [{"op": "set_clip", "sequence": seq_id, "track": tr["id"], "clip": {"id": cid, "graphic": g}}]}); await broadcast(ev); return {"layers": len(new_layers)}
+    return await _editorial_source_command(await req.json(), "split_words")
 
 @app.post("/api/media/input_transform")
 async def media_input_transform(req: Request):
-    """Assign a camera log → Rec.709 input transform to a media item: {media_id, transform: none|slog3|vlog|clog3|logc3}"""
-    body = await req.json(); tr = body.get("transform") or "none"
-    if tr not in ("none", "slog3", "vlog", "clog3", "logc3"): raise HTTPException(400, "unknown transform")
-    with LOCK:
-        proj = load_project(); m = proj["media"].get(body["media_id"])
-        if not m: raise HTTPException(404)
-        if tr == "none": m.pop("input_transform", None)
-        else: m["input_transform"] = tr
-        save_project(proj)
-    ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": [m["id"]], "input_transform": tr}); await broadcast(ev); return m
+    return await _editorial_source_command(await req.json(), "input_transform")
 
 @app.post("/api/media/extract_audio")
 async def media_extract_audio(req: Request):
-    """Extract Audio: an audio-only bin item referencing the same file."""
-    body = await req.json()
-    with LOCK:
-        proj = load_project(); m = proj["media"].get(body["media_id"])
-        if not m or not m.get("has_audio"): raise HTTPException(404)
-        nid = str(uuid.uuid4())[:8]; proj["media"][nid] = {**m, "id": nid, "name": os.path.splitext(m["name"])[0] + " Extracted.wav", "has_video": False, "thumb": None, "strip": None, "extracted_from": m["id"], "added": time.time()}; save_project(proj)
-    ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": [nid], "extracted": True}); await broadcast(ev); return proj["media"][nid]
+    return await _editorial_source_command(await req.json(), "extract_audio")
 
 # ---------- synthetic media (New Item), audio gain, render & replace, EDL/VTT, app events ----------
 SFX = {  # generated sound effects (no assets needed): lavfi graphs producing stereo 48 kHz WAV
@@ -1507,18 +3024,42 @@ SFX = {  # generated sound effects (no assets needed): lavfi graphs producing st
 async def media_import_sequence(req: Request):
     """Import a numbered image sequence as one clip: {folder, fps} — frames like shot_0001.png … become a video-like media item."""
     import re as _re
-    body = await req.json(); folder = body["folder"]; fps = float(body.get("fps", 24))
-    files = sorted(f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".dpx")))
+    from input_options import numbered_input_options
+    body = await req.json()
+    if not isinstance(body, dict) or not isinstance(body.get("folder"), str) or not body["folder"] or "\x00" in body["folder"]:
+        raise HTTPException(422, "Choose a numbered source folder.")
+    try:
+        if isinstance(body.get("fps", 24), bool): raise ValueError("Frame rate must be numeric.")
+        fps = float(body.get("fps", 24)); numbered_input_options(fps)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise HTTPException(422, str(error)) from error
+    folder = os.path.abspath(body["folder"])
+    with LOCK:
+        pid = active_id(); proj = load_project(); expected = project_context(ROOT, pid, proj)
+    try:
+        files = sorted(f for f in os.listdir(folder) if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".dpx")))
+    except OSError as error:
+        raise HTTPException(422, "Numbered source folder is unavailable.") from error
     if len(files) < 2: raise HTTPException(400, "need at least two numbered frames")
+    if len(files) > 1000000: raise HTTPException(422, "Numbered sources support at most 1,000,000 frames.")
     m_ = _re.match(r"^(.*?)(\d+)(\.[^.]+)$", files[0])
     if not m_: raise HTTPException(400, "frames must be numbered (name0001.png)")
-    prefix, num, ext = m_.groups(); pattern = os.path.join(folder, f"{prefix}%0{len(num)}d{ext}"); start = int(num)
-    first = os.path.join(folder, files[0]); info = probe(first); mid = str(uuid.uuid4())[:8]
-    m = {"id": mid, "name": f"{prefix or os.path.basename(folder)} [{len(files)} frames]", "path": pattern, "duration": len(files) / fps, "width": info["width"], "height": info["height"], "fps": fps, "is_image": False, "has_video": True, "has_audio": False, "sequence_frames": len(files), "input_opts": ["-framerate", f"{fps:g}", "-start_number", str(start)], "thumb": None, "strip": None, "wave": None, "status": "ingesting", "added": time.time()}
+    prefix, num, ext = m_.groups(); pattern = os.path.join(folder, prefix).replace("%", "%%") + f"%0{len(num)}d{ext}"
+    try:
+        start = int(num); source_options = numbered_input_options(fps, start)
+        numbered_input_options(fps, start + len(files) - 1)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    if any(not os.path.isfile(pattern % (start + i)) for i in range(len(files))):
+        raise HTTPException(422, "Numbered frames must be consecutive and share one name and extension.")
+    first = os.path.join(folder, files[0]); info = await asyncio.to_thread(probe, first); mid = str(uuid.uuid4())[:8]
+    m = {"id": mid, "name": f"{prefix or os.path.basename(folder)} [{len(files)} frames]", "path": pattern, "duration": len(files) / fps, "width": info["width"], "height": info["height"], "fps": fps, "is_image": False, "has_video": True, "has_audio": False, "sequence_frames": len(files), "input_opts": source_options, "thumb": None, "strip": None, "wave": None, "status": "ingesting", "added": time.time()}
     with LOCK:
-        proj = load_project(); proj["media"][mid] = m; save_project(proj)
-    threading.Thread(target=finish_ingest, args=(mid, pattern, {**info, "has_video": True, "has_audio": False, "duration": m["duration"], "is_image": False, "input_opts": m["input_opts"]}), daemon=True).start()
-    ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": [mid]}); await broadcast(ev); return m
+        proj = load_project(); require_project_context({"_context": expected}, active_id(), proj)
+        token = uuid.uuid4().hex[:12]; m["ingest_token"] = token; project_file = PP("project.json")
+        proj["media"][mid] = m; save_project(proj, project_file)
+    finish_ingest(mid, pattern, m, project_file, token)
+    ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": [mid]}, project_id=pid); await broadcast(ev); return m
 
 @app.post("/api/media/sfx")
 async def media_sfx(req: Request):
@@ -1543,36 +3084,189 @@ async def media_synthetic(req: Request):
 
 @app.post("/api/audio/peak")
 async def audio_peak(req: Request):
-    """Max peak (dBFS) of a media range via volumedetect — for Audio Gain → Normalize Max Peak. {media_id, in, out}"""
-    body = await req.json(); proj = load_project(); m = proj["media"].get(body["media_id"])
-    if not m or not m.get("has_audio") or m.get("synthetic"): raise HTTPException(404)
-    src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m; off = float(m.get("sub_in", 0) or 0)
-    i, o = float(body.get("in", 0)) + off, float(body.get("out", m["duration"])) + off
-    r = (await asyncio.to_thread(subprocess.run, ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{i:.3f}", "-t", f"{max(o - i, 0.1):.3f}", "-i", src["path"], "-vn", "-af", "volumedetect", "-f", "null", "-"], capture_output=True, text=True, timeout=300)).stderr
-    import re as _re; mx = _re.search(r"max_volume:\s*(-?[\d.]+) dB", r); mean = _re.search(r"mean_volume:\s*(-?[\d.]+) dB", r)
-    return {"max_peak_db": float(mx.group(1)) if mx else None, "mean_db": float(mean.group(1)) if mean else None}
+    return await _queue_audio_workflow(await req.json(), "peak")
+
+def _audio_edit_policy(body):
+    if body.get("actor", "human") == "human": return
+    try:
+        with open(P("settings.json"), encoding="utf-8") as stream: mode = json.load(stream).get("agent_mode") or "direct"
+    except FileNotFoundError: mode = "direct"
+    except (OSError, ValueError, TypeError, AttributeError) as error: raise HTTPException(403, "Could not read agent editing preferences") from error
+    if mode == "proposals_only": raise HTTPException(403, "Direct agent audio edits are disabled. Ask the editor to review and apply this audio change.")
+
+async def _queue_audio_workflow(body, mode):
+    import audio_workflow as audio
+    project, expected = _workflow_capture(body)
+    if TASKS is None: raise HTTPException(503, "Background tasks are unavailable")
+    try:
+        import re
+        if not isinstance(body.get("request_id"), str) or not re.fullmatch("[a-f0-9]{32}", body["request_id"]): raise ValueError("Supply a unique audio analysis request_id")
+        payload = await asyncio.to_thread(audio.capture, project, body, mode, expected)
+        with LOCK:
+            require_project_context({"_context": expected}, active_id(), load_project())
+            task = TASKS.submit("audio_analysis", {"peak": "Normalize audio peak", "loudness": "Normalize audio loudness", "beats": "Detect audio transients"}[mode], expected, payload, identity=body["request_id"])
+    except (TaskError, ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(400, str(error)) from error
+    return {"ok": True, "task": task, "context": expected, "message": "Audio analysis queued. Review its measurements before applying changes."}
+
+def _task_audio_workflow(payload, task):
+    import audio_workflow, audio_measurement
+    task.check(); audio_workflow.check_sources(payload)
+    result = audio_measurement.analyze(payload, task)
+    task.check(); audio_workflow.check_sources(payload)
+    result.update(media_id=payload.get("media_id"), range=payload.get("range"))
+    return result
+
+def _review_audio_workflow(value, project, expected):
+    import audio_workflow as audio
+    if value["record"]["kind"] != "audio_analysis" or value["record"]["status"] != "ready" or value.get("result") is None:
+        raise HTTPException(409, "This audio result is not ready for review")
+    try: plan = audio.plan(project, value["payload"], value["result"], expected, value["record"]["id"])
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(409, str(error)) from error
+    return {"ok": True, "task": value["record"], "context": expected, "result": value["result"], "plan": plan}
+
+@app.post("/api/tasks/{identity}/audio")
+async def background_audio_review(identity: str, req: Request):
+    value = _owned_task(identity); project, expected = _workflow_capture(await req.json())
+    reviewed = await asyncio.to_thread(_review_audio_workflow, value, project, expected)
+    _workflow_capture({"_context": expected})
+    if _owned_task(identity)["record"]["status"] != "ready": raise HTTPException(409, "This audio task is no longer ready")
+    return reviewed
+
+@app.post("/api/audio/gain")
+async def audio_gain(req: Request):
+    import audio_workflow as audio
+    body = await req.json(); project, expected = _workflow_capture(body); _audio_edit_policy(body)
+    try:
+        plan = await asyncio.to_thread(audio.manual, project, body)
+        _workflow_capture({"_context": expected})
+        if not plan["ops"]: return {"ok": True, "context": expected, **plan["summary"]}
+        apply_ops(project, plan["ops"]); parse_project(json.dumps(project, allow_nan=False).encode("utf-8"))
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(422, str(error)) from error
+    return await _workflow_commit(project, expected, plan["summary"], "audio_gain", body.get("actor", "human"))
+
+async def _apply_audio_workflow(identity, value, body, project, expected):
+    payload = value["payload"]
+    if payload["scope"] != "timeline": raise HTTPException(409, "Raw audio measurements are read-only")
+    sequence = next((s for s in project.get("sequences", []) if s.get("id") == payload["sequence"]), None)
+    if (sequence or {}).get("workflow", {}).get("audio_tasks", {}).get(identity):
+        TASKS.finish_apply(identity, success=True, message="Audio edit already applied")
+        return {"ok": True, "context": expected, "message": "Audio edit already applied; no changes repeated"}
+    _audio_edit_policy(body)
+    reviewed = await asyncio.to_thread(_review_audio_workflow, value, project, expected); plan = reviewed["plan"]
+    if not isinstance(body.get("fingerprint"), str) or body["fingerprint"] != plan["fingerprint"]:
+        raise HTTPException(409, "The audio review changed; review the measurements again before applying")
+    _workflow_capture({"_context": expected})
+    if not plan["ops"]: return {"ok": True, "context": expected, "changed": False, "message": "No audio changes are needed"}
+    try: TASKS.begin_apply(identity)
+    except (TaskError, OSError) as error: raise HTTPException(409, str(error)) from error
+    try:
+        apply_ops(project, plan["ops"])
+        sequence = next(s for s in project["sequences"] if s["id"] == payload["sequence"])
+        sequence.setdefault("workflow", {}).setdefault("audio_tasks", {})[identity] = {"fingerprint": plan["fingerprint"], "mode": payload["mode"], "clips": payload["clip_ids"]}
+        parse_project(json.dumps(project, allow_nan=False).encode("utf-8"))
+        response = await _workflow_commit(project, expected, plan["summary"], "audio_analysis", body.get("actor", "human"))
+    except BaseException:
+        TASKS.finish_apply(identity, success=False, message="Audio apply was not confirmed. Check the project before retrying.")
+        raise
+    task = TASKS.finish_apply(identity, success=True, message="Audio edit applied")
+    if task.get("warning"): response["warning"] = (response.get("warning", "") + "; " + task["warning"]).strip("; ")
+    return response
 
 @app.post("/api/render_replace")
 async def render_replace(req: Request):
-    """Render and Replace: bake one clip (with all effects) to a new media file and swap it into the timeline."""
-    body = await req.json(); seq_id = body.get("sequence", "seq1"); cid = body["clip_id"]
-    proj = load_project(); seq = next(s for s in proj["sequences"] if s["id"] == seq_id)
-    tr = next((t for t in seq["tracks"] for c in t["clips"] if c["id"] == cid), None); c = next(x for x in tr["clips"] if x["id"] == cid)
-    from render import clip_dur as _cd
-    tmp = copy.deepcopy(proj); tseq = next(s for s in tmp["sequences"] if s["id"] == seq_id); tseq["captions"] = []; tseq["in_point"] = None; tseq["out_point"] = None
-    for t in tseq["tracks"]: t["clips"] = [dict(x, start=0.0, transition_in=None, transition_out=None) for x in t["clips"] if x["id"] == cid] if t["id"] == tr["id"] else []
-    os.makedirs(P("media"), exist_ok=True); out = P("media", f"rendered_{cid}_{int(time.time())}.mp4")
-    await asyncio.to_thread(do_render, tmp, seq_id, out, {"crf": 16, "x264_preset": "fast"})
-    with LOCK:
-        proj = load_project(); mid, m = await asyncio.to_thread(ingest, out, f"{cid} (rendered)"); proj["media"][mid] = m
-        seq = next(s for s in proj["sequences"] if s["id"] == seq_id); tr = next(t for t in seq["tracks"] for x in t["clips"] if x["id"] == cid); c = next(x for x in tr["clips"] if x["id"] == cid)
-        keep = {k: c[k] for k in ("id", "start", "label", "group", "markers", "transition_in", "transition_out", "audio_transition_in", "audio_transition_out") if k in c}
-        c.clear(); c.update({"media_id": mid, "in_": 0.0, "out": _cd(dict(keep, **{"in_": 0, "out": m["duration"], "speed": 1})) if False else m["duration"], "speed": 1.0, "transform": {"x": 0, "y": 0, "scale": 1, "rotation": 0, "opacity": 1}, "audio": {"gain_db": 0, "linked": True}, "keyframes": {}, "color": {}, "rendered_from": cid, **keep}); save_project(proj)
-    ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "render_replace", "reason": f"baked {cid}", "ops": []}); await broadcast(ev); return {"media": mid, "path": out}
+    """Capture an acknowledged clip for a cancellable, reviewable lossless bake."""
+    import render_replace as bake
+    body = await req.json(); project, expected = _workflow_capture(body)
+    if TASKS is None: raise HTTPException(503, "Background tasks are unavailable")
+    try:
+        bake._identity(body.get("request_id"))
+        payload = await asyncio.to_thread(bake.capture, project, body, expected, ROOT)
+        with LOCK:
+            require_project_context({"_context": expected}, active_id(), load_project())
+            task = TASKS.submit("render_replace", "Render and Replace — " + payload["clip_id"], expected, payload, identity=body.get("request_id"))
+    except (ValueError, KeyError, TypeError, OSError) as error: raise HTTPException(400, str(error)) from error
+    return {"ok": True, "task": task, "context": expected, "message": "Lossless bake queued. Review the result in Tasks before replacing the clip."}
+
+def _task_render_replace(payload, task):
+    import render_replace as bake
+    return bake.bake(payload, task)
+
+def _review_render_replace(value, project, expected):
+    import render_replace as bake
+    if value["record"]["kind"] != "render_replace" or value["record"]["status"] != "ready" or value.get("result") is None:
+        raise HTTPException(409, "This bake is not ready for review")
+    try:
+        bake.validate_current(project, value["payload"], expected, ROOT)
+        plan = bake.plan(project, value["payload"], value["result"], value["record"]["id"])
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(409, str(error)) from error
+    return {"ok": True, "task": value["record"], "context": expected, "result": value["result"], "plan": plan}
+
+@app.post("/api/tasks/{identity}/render-replace")
+async def background_render_replace_review(identity: str, req: Request):
+    value = _owned_task(identity); project, expected = _workflow_capture(await req.json())
+    reviewed = await asyncio.to_thread(_review_render_replace, value, project, expected)
+    # Slow hashes/probes cannot return a review for a different active revision.
+    _workflow_capture({"_context": expected})
+    return reviewed
+
+@app.get("/api/tasks/{identity}/render-replace/preview")
+async def background_render_replace_preview(identity: str):
+    import render_replace as bake
+    value = _owned_task(identity)
+    if value["record"]["kind"] != "render_replace" or value["record"]["status"] not in ("ready", "applied") or value.get("result") is None:
+        raise HTTPException(409, "This bake preview is not available")
+    try: path = await asyncio.to_thread(bake.preview_path, value["payload"], value["result"], identity)
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(409, str(error)) from error
+    _owned_task(identity)
+    return FileResponse(path, media_type="audio/wav" if value["payload"]["kind"] == "audio" else "image/png")
+
+async def _apply_render_replace(identity, value, body, project, expected):
+    import render_replace as bake
+    payload = value["payload"]
+    sequence = next((s for s in project.get("sequences", []) if s.get("id") == payload["sequence"]), None)
+    receipt = (sequence or {}).get("workflow", {}).get("render_replace", {}).get(identity)
+    if receipt:
+        TASKS.finish_apply(identity, success=True, message="Replacement already applied")
+        return {"ok": True, "context": expected, "message": "Replacement already applied; no edit repeated"}
+    if body.get("actor", "human") != "human":
+        try:
+            with open(P("settings.json"), encoding="utf-8") as stream: mode = json.load(stream).get("agent_mode") or "direct"
+        except FileNotFoundError: mode = "direct"
+        except (OSError, ValueError, TypeError, AttributeError) as error: raise HTTPException(403, "Could not read agent editing preferences") from error
+        if mode == "proposals_only": raise HTTPException(403, "Direct agent edits are disabled. Ask the editor to review and apply this owned bake in Tasks.")
+    reviewed = await asyncio.to_thread(_review_render_replace, value, project, expected); plan = reviewed["plan"]
+    if not isinstance(body.get("fingerprint"), str) or body["fingerprint"] != plan["fingerprint"]:
+        raise HTTPException(409, "The replacement plan changed. Review it again before applying")
+    _workflow_capture({"_context": expected})
+    try: TASKS.begin_apply(identity)
+    except (TaskError, OSError) as error: raise HTTPException(409, str(error)) from error
+    try:
+        await _owned_render_thread(bake.publish, payload, value["result"], identity)
+        await asyncio.to_thread(bake.validate_current, project, payload, expected, ROOT)
+        apply_ops(project, plan["ops"])
+        sequence = next(s for s in project["sequences"] if s["id"] == payload["sequence"])
+        sequence.setdefault("workflow", {}).setdefault("render_replace", {})[identity] = {
+            "clip_id": payload["clip_id"], "media_id": plan["summary"]["media_id"], "sha256": value["result"]["sha256"]}
+        result = await _workflow_commit(project, expected, plan["summary"], "render_replace", body.get("actor", "human"))
+    except BaseException:
+        TASKS.finish_apply(identity, success=False, message="Replacement apply was not confirmed. Check the project before retrying.")
+        raise
+    task = TASKS.finish_apply(identity, success=True, message="Replacement applied")
+    warnings = [result.get("warning"), task.get("warning")]
+    media = project["media"][plan["summary"]["media_id"]]
+    try:
+        prepared = finish_ingest(media["id"], media["path"], media, P("projects", expected["project"], "project.json"), media["ingest_token"])
+        if prepared.get("error"): warnings.append("Replacement saved; playback preparation unavailable: " + str(prepared["error"]))
+    except Exception as error: warnings.append("Replacement saved; playback preparation unavailable: " + str(error)[:300])
+    result["warning"] = "; ".join(w for w in warnings if w)
+    return result
 
 @app.get("/api/export/edl")
 def export_edl(sequence: str = "seq1", track: str = "V1"):
-    from fastapi.responses import PlainTextResponse; return PlainTextResponse(to_edl(load_project(), sequence, track), headers={"Content-Disposition": f"attachment; filename={sequence}_{track}.edl"})
+    try: edl = to_edl(load_project(), sequence, track)
+    except (ValueError, StopIteration) as error: raise HTTPException(400, str(error) or "Sequence not found") from error
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(edl, headers={"Content-Disposition": f"attachment; filename={sequence}_{track}.edl"})
 
 @app.get("/api/captions/export_vtt")
 def captions_export_vtt(sequence: str = "seq1"):
@@ -1603,31 +3297,69 @@ def _envelope(path, seconds=90, rate=50):
 
 @app.post("/api/audio/sync")
 async def audio_sync(req: Request):
-    """Offsets (seconds) that align each media's audio to the first one, by cross-correlating loudness envelopes. {media_ids:[…]}"""
-    body = await req.json(); proj = load_project(); ids = body.get("media_ids", [])
-    if len(ids) < 2: raise HTTPException(400, "need two or more media ids")
-    envs = {}
-    for mid in ids:
-        m = proj["media"].get(mid)
-        if not m or not m.get("has_audio"): envs[mid] = None; continue
-        src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m; envs[mid] = await asyncio.to_thread(_envelope, src["path"])
-    ref = envs[ids[0]]; out = {ids[0]: 0.0}
-    if not ref: raise HTTPException(400, "reference clip has no audio")
-    a, rate = ref; la = len(a)
-    for mid in ids[1:]:
-        e = envs.get(mid)
-        if not e: out[mid] = None; continue
-        b = e[0]; best, best_lag = -1e9, 0; maxlag = min(len(b), la) - 5
-        for lag in range(-maxlag, maxlag):
-            s_ = 0.0; cnt = 0
-            for i in range(0, la, 2):
-                j = i + lag
-                if 0 <= j < len(b): s_ += a[i] * b[j]; cnt += 1
-            if cnt > 20:
-                s_ /= cnt
-                if s_ > best: best, best_lag = s_, lag
-        out[mid] = round(-best_lag / rate, 3)  # positive: this clip starts later than the reference
-    return {"offsets": out, "rate": rate}
+    import audio_sync as sync
+    body = await req.json(); project, expected = _workflow_capture(body)
+    if TASKS is None: raise HTTPException(503, "Background tasks are unavailable")
+    try:
+        if not isinstance(body.get("request_id"), str) or len(body["request_id"]) != 32: raise ValueError("Supply a unique synchronization request_id")
+        payload = await asyncio.to_thread(sync.capture, project, body, expected)
+        with LOCK:
+            require_project_context({"_context": expected}, active_id(), load_project())
+            task = TASKS.submit("sync", "Synchronize audio", expected, payload, identity=body["request_id"])
+    except (TaskError, ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(400, str(error)) from error
+    return {"ok": True, "task": task, "context": expected, "message": "Audio synchronization queued. Review quality and offsets in Tasks before applying."}
+
+def _task_audio_sync(payload, task):
+    import audio_sync as sync
+    return sync.analyze(payload, task)
+
+def _review_audio_sync(value, project, expected):
+    import audio_sync as sync
+    if value["record"]["kind"] != "sync" or value["record"]["status"] != "ready" or value.get("result") is None:
+        raise HTTPException(409, "This synchronization result is not ready for review")
+    try: plan = sync.plan(project, value["payload"], value["result"], expected, value["record"]["id"])
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(409, str(error)) from error
+    return {"ok": True, "task": value["record"], "context": expected, "result": value["result"], "plan": plan}
+
+@app.post("/api/tasks/{identity}/sync")
+async def background_sync_review(identity: str, req: Request):
+    value = _owned_task(identity); project, expected = _workflow_capture(await req.json())
+    reviewed = await asyncio.to_thread(_review_audio_sync, value, project, expected)
+    _workflow_capture({"_context": expected})
+    if _owned_task(identity)["record"]["status"] != "ready": raise HTTPException(409, "The synchronization task is no longer ready")
+    return reviewed
+
+async def _apply_audio_sync(identity, value, body, project, expected):
+    payload = value["payload"]
+    if payload["mode"] != "timeline": raise HTTPException(409, "Raw source synchronization is read-only; review offsets before creating a multicam or merged clip")
+    sequence = next((s for s in project.get("sequences", []) if s.get("id") == payload["sequence"]), None)
+    if (sequence or {}).get("workflow", {}).get("sync_tasks", {}).get(identity):
+        TASKS.finish_apply(identity, success=True, message="Synchronization already applied")
+        return {"ok": True, "context": expected, "message": "Synchronization already applied; no moves repeated"}
+    if body.get("actor", "human") != "human":
+        try:
+            with open(P("settings.json"), encoding="utf-8") as stream: mode = json.load(stream).get("agent_mode") or "direct"
+        except FileNotFoundError: mode = "direct"
+        except (OSError, ValueError, TypeError, AttributeError) as error: raise HTTPException(403, "Could not read agent editing preferences") from error
+        if mode == "proposals_only": raise HTTPException(403, "Direct agent edits are disabled. Ask the editor to review and apply synchronization in Tasks.")
+    reviewed = await asyncio.to_thread(_review_audio_sync, value, project, expected); plan = reviewed["plan"]
+    if not isinstance(body.get("fingerprint"), str) or body["fingerprint"] != plan["fingerprint"]:
+        raise HTTPException(409, "The synchronization review changed; review the offsets again before applying")
+    _workflow_capture({"_context": expected})
+    if not plan["ops"]: return {"ok": True, "context": expected, "changed": False, "message": "The selected clips are already aligned; no project changes were made"}
+    try: TASKS.begin_apply(identity)
+    except (TaskError, OSError) as error: raise HTTPException(409, str(error)) from error
+    try:
+        apply_ops(project, plan["ops"])
+        sequence = next(s for s in project["sequences"] if s["id"] == payload["sequence"])
+        sequence.setdefault("workflow", {}).setdefault("sync_tasks", {})[identity] = {"fingerprint": plan["fingerprint"], "clips": [item["id"] for item in payload["items"]]}
+        response = await _workflow_commit(project, expected, plan["summary"], "synchronize", body.get("actor", "human"))
+    except BaseException:
+        TASKS.finish_apply(identity, success=False, message="Synchronization apply was not confirmed. Check the project before retrying.")
+        raise
+    task = TASKS.finish_apply(identity, success=True, message="Synchronization applied")
+    if task.get("warning"): response["warning"] = (response.get("warning", "") + "; " + task["warning"]).strip("; ")
+    return response
 
 def _beats(path, seconds):
     env, rate = _envelope(path, seconds=seconds, rate=50); on = [max(0.0, env[i] - env[i - 1]) for i in range(1, len(env))]; best, bestlag = -1, int(rate * 60 / 120)
@@ -1642,64 +3374,16 @@ def _beats(path, seconds):
 
 @app.post("/api/audio/silences")
 async def audio_silences(req: Request):
-    """Silences in a media file's audio: {media_id, in?, out?, threshold_db (default -38), min_gap (s, default 0.45), pad (s, default 0.08)} →
-    [{start, end}] in media time. Used by Sequence › Remove Silences (talking-head tightening) and by agents."""
-    body = await req.json(); proj = load_project(); m = proj["media"].get(body["media_id"])
-    if not m or not m.get("has_audio"): raise HTTPException(404)
-    src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m; total = float(m["duration"]); thr = float(body.get("threshold_db", -38)); ming = float(body.get("min_gap", 0.45)); pad = float(body.get("pad", 0.08))
-    env, rate = await asyncio.to_thread(_envelope, src["path"], min(3600, int(total) + 1), 50)
-    import math as _m
-    db = [20 * _m.log10(max(e, 1e-6)) for e in env]; ref = max(db) if db else 0; gaps = []; start = None
-    for i, v in enumerate(db):
-        quiet = v < ref + thr
-        if quiet and start is None: start = i / rate
-        elif not quiet and start is not None:
-            if i / rate - start >= ming: gaps.append({"start": round(start + pad, 3), "end": round(i / rate - pad, 3)})
-            start = None
-    if start is not None and total - start >= ming: gaps.append({"start": round(start + pad, 3), "end": round(total, 3)})
-    lo, hi = float(body.get("in", 0)), float(body.get("out", total)); gaps = [g for g in gaps if g["end"] > lo and g["start"] < hi and g["end"] - g["start"] > 0.05]
-    return {"silences": gaps, "removed": round(sum(g["end"] - g["start"] for g in gaps), 2), "threshold_db": thr}
+    return _queue_media_analysis(await req.json(), "silences")
 
 @app.post("/api/audio/beats")
 async def audio_beats(req: Request):
-    """Beat grid for a music item: {media_id, in?, out?} → {bpm, beats:[t…] (media time), downbeats:[t…]} — cut on the beat, or let the agent."""
-    body = await req.json(); proj = load_project(); m = proj["media"].get(body["media_id"])
-    if not m or not m.get("has_audio"): raise HTTPException(404)
-    src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m; total = float(m["duration"])
-    beat, phase = await asyncio.to_thread(_beats, src["path"], min(600, int(total) + 1))
-    beats = []; t = phase
-    while t < total: beats.append(round(t, 3)); t += beat
-    return {"bpm": round(60 / beat, 1), "beat": round(beat, 4), "beats": beats, "downbeats": beats[::4]}
+    return await _queue_audio_workflow(await req.json(), "beats")
 
 @app.post("/api/audio/remix")
 async def audio_remix(req: Request):
-    """Remix (music retarget): shorten/lengthen a music file to a target duration by removing or repeating whole bars found from the
-    loudness envelope's tempo. {media_id, target, bars_per_phrase} → segments [{in, out}] to place back-to-back with crossfades."""
-    body = await req.json(); proj = load_project(); m = proj["media"].get(body["media_id"])
-    if not m or not m.get("has_audio"): raise HTTPException(404)
-    src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m; target = float(body["target"]); total = float(m["duration"]); bpp = int(body.get("bars_per_phrase", 4))
-    env, rate = await asyncio.to_thread(_envelope, src["path"], seconds=min(600, int(total) + 1), rate=50)
-    # tempo: autocorrelation of the onset (positive envelope difference) between 60 and 180 BPM
-    on = [max(0.0, env[i] - env[i - 1]) for i in range(1, len(env))]; best, bestlag = -1, int(rate * 60 / 120)
-    for lag in range(int(rate * 60 / 180), int(rate * 60 / 60) + 1):
-        s_ = sum(on[i] * on[i - lag] for i in range(lag, len(on)))
-        if s_ > best: best, bestlag = s_, lag
-    beat = bestlag / rate; bar = beat * 4; phrase = bar * bpp
-    # downbeat phase: the offset (within one bar) whose beats hit the strongest onsets
-    bestp, bestv = 0.0, -1
-    for k in range(int(bar * rate)):
-        v = sum(on[i] for i in range(k, len(on), max(1, int(round(beat * rate)))))
-        if v > bestv: bestv, bestp = v, k / rate
-    if target >= total - 0.05:  # lengthen: repeat the middle phrases
-        need = target - total; segs = [{"in": 0.0, "out": total}]; loop_in = bestp + phrase * max(1, int(((total - bestp) / phrase) // 3)); loop_out = min(total, loop_in + phrase)
-        while need > 0.2 and loop_out > loop_in + 0.5: segs.insert(1, {"in": loop_in, "out": loop_out}); need -= (loop_out - loop_in)
-        return {"segments": segs, "bpm": round(60 / beat, 1), "bar": round(bar, 3), "phrase": round(phrase, 3), "downbeat": round(bestp, 3), "achieved": round(sum(sg["out"] - sg["in"] for sg in segs), 3)}
-    cut = total - target; n_phr = max(1, int(round(cut / phrase))); remove = n_phr * phrase
-    if remove > total * 0.8: remove = phrase * max(1, int((total * 0.8) // phrase))
-    # remove whole phrases from the middle third, keeping the intro and the outro intact
-    start_rm = bestp + phrase * max(1, int(((total - bestp) / phrase) // 3)); end_rm = min(total - phrase, start_rm + remove)
-    segs = [{"in": 0.0, "out": round(start_rm, 3)}, {"in": round(end_rm, 3), "out": total}]
-    return {"segments": segs, "bpm": round(60 / beat, 1), "bar": round(bar, 3), "phrase": round(phrase, 3), "downbeat": round(bestp, 3), "achieved": round(sum(sg["out"] - sg["in"] for sg in segs), 3)}
+    """Queue a bounded remix duration plan. Review in Tasks before applying it."""
+    return _queue_media_analysis(await req.json(), "remix")
 
 @app.get("/api/markers/export")
 def markers_export(sequence: str = "seq1", fmt: str = "chapters"):
@@ -1733,27 +3417,11 @@ def fs_list(path: str = ""):
 
 @app.post("/api/media/subclip")
 async def media_subclip(req: Request):
-    body = await req.json()
-    with LOCK:
-        proj = load_project(); m = proj["media"].get(body["media_id"])
-        if not m: raise HTTPException(404)
-        i, o = float(body["in"]), float(body["out"])
-        if o <= i: raise HTTPException(400, "out must be after in")
-        sid = str(uuid.uuid4())[:8]; sub = {**m, "id": sid, "name": body.get("name") or f"{m['name']}.sub{len([x for x in proj['media'].values() if x.get('subclip_of') == m['id']]) + 1}", "subclip_of": m["id"], "sub_in": i, "duration": o - i, "added": time.time()}
-        proj["media"][sid] = sub; save_project(proj)
-    ev = log_event({"type": "media_added", "actor": body.get("actor", "human"), "media": [sid], "subclip": [body["media_id"], i, o]}); await broadcast(ev); return sub
+    return await _source_creation_command(await req.json(), "subclip")
 
 @app.post("/api/audio/measure")
 async def audio_measure(req: Request):
-    """Integrated loudness / true peak of a media range (for auto-match). {media_id, in, out}"""
-    body = await req.json(); proj = load_project(); m = proj["media"].get(body["media_id"])
-    if not m or not m.get("has_audio"): raise HTTPException(404)
-    src = proj["media"][m["subclip_of"]] if m.get("subclip_of") else m; off = float(m.get("sub_in", 0) or 0)
-    i, o = float(body.get("in", 0)) + off, float(body.get("out", m["duration"])) + off
-    r = (await asyncio.to_thread(subprocess.run, ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{i:.3f}", "-t", f"{max(o - i, 0.1):.3f}", "-i", src["path"], "-vn", "-filter_complex", "ebur128=peak=true", "-f", "null", "-"], capture_output=True, text=True, timeout=300)).stderr
-    import re as _re; tail = r.split("Summary:")[-1]
-    lufs = _re.search(r"I:\s+(-?[\d.]+) LUFS", tail); tp = _re.search(r"Peak:\s+(-?[\d.]+) dBFS", tail)
-    return {"integrated_lufs": float(lufs.group(1)) if lufs else None, "true_peak_dbtp": float(tp.group(1)) if tp else None}
+    return await _queue_audio_workflow(await req.json(), "loudness")
 
 # ---------- collaboration data: client events, session summary, training export ----------
 @app.post("/api/events")
@@ -1806,22 +3474,48 @@ def training_export():
 async def render_job(req: Request):
     """{sequence, preset, name, actor, outputs?:[{suffix, width, height, fit}]} — with outputs, one job per derived output (center-crop or pad)."""
     body = await req.json(); seq_id = body.get("sequence", "seq1"); preset = body.get("preset", {}); name = body.get("name") or f"render_{int(time.time())}"
-    proj = copy.deepcopy(load_project()); outs = body.get("outputs")
-    if not outs: return start_render(proj, seq_id, preset, name, body.get("actor", "human"))
+    proj, context = preview_state(body); outs = body.get("outputs")
+    report = await asyncio.to_thread(check_export_resources, proj, seq_id, preset)
+    preview_state({"_context": context})
+    if not outs: return start_render(proj, seq_id, preset, name, body.get("actor", "human"), report, context=context)
     jobs = []
     for o in outs:
         pr = dict(preset); pr.update({"out_w": o.get("width"), "out_h": o.get("height"), "fit": o.get("fit", "crop")})
-        jobs.append(start_render(proj, seq_id, pr, f"{name}_{o.get('suffix') or (str(o.get('width')) + 'x' + str(o.get('height')))}", body.get("actor", "human")))
+        jobs.append(start_render(proj, seq_id, pr, f"{name}_{o.get('suffix') or (str(o.get('width')) + 'x' + str(o.get('height')))}", body.get("actor", "human"), report, context=context))
     return {"jobs": jobs}
 
+@app.post("/api/render/preflight")
+async def render_preflight(req: Request):
+    body = await req.json(); proj, context = preview_state(body); preset = body.get("preset") or {}
+    ids = [s["id"] for s in proj["sequences"] if not s.get("multicam") and not s.get("merged")] if body.get("all_sequences") else [body.get("sequence", "seq1")]
+    reports = [await asyncio.to_thread(inspect_export_resources, proj, sid, preset) for sid in ids]
+    preview_state({"_context": context})
+    return {"ok": all(r["ok"] for r in reports), "context": context, "reports": reports,
+            "errors": sum(r["errors"] for r in reports), "warnings": sum(r["warnings"] for r in reports),
+            "issues": [i for r in reports for i in r["issues"]]}
+
+@app.get("/api/processing")
+def processing_status():
+    from work_budget import BUDGET
+    return BUDGET.snapshot()
+
 @app.get("/api/jobs")
-def jobs_list(): return sorted(JOBS.values(), key=lambda j: j["started"], reverse=True)[:50]
+def jobs_list():
+    from work_budget import status
+    with RENDER_STATE_LOCK:
+        result = copy.deepcopy(sorted(JOBS.values(), key=lambda j: j["started"], reverse=True)[:50])
+        for job in result:
+            state = status(RENDER_PROCS.get(job['id']))
+            if state: job['resource'] = state
+        return result
 
 @app.get("/api/encoders")
 def encoders():
-    out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
-    avail = [e for e in ("libx264", "h264_nvenc", "h264_videotoolbox", "h264_qsv", "h264_vaapi", "h264_amf", "libx265", "hevc_nvenc", "hevc_videotoolbox") if f" {e} " in out]
-    return {"encoders": avail}
+    from encoder_capabilities import CAPABILITIES
+    try: return CAPABILITIES.catalog()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise HTTPException(503, "Encoder discovery failed: " + str(error))
+
 
 @app.get("/api/settings")
 def settings_get(): p = P("settings.json"); return json.load(open(p)) if os.path.exists(p) else {}
@@ -1833,28 +3527,77 @@ async def settings_put(req: Request):
     if os.path.exists(P("settings.json")):
         try: cur = json.load(open(P("settings.json")))
         except Exception: cur = {}
+    if isinstance(body, dict) and isinstance(body.get("prefs"), dict) and "proxy" in body["prefs"]:
+        from proxy_media import settings as proxy_settings
+        try: body["prefs"]["proxy"] = proxy_settings(body["prefs"]["proxy"])
+        except ValueError as error: raise HTTPException(422, str(error)) from error
     cur.update(body or {}); json.dump(cur, open(P("settings.json"), "w"), indent=1); return cur
 
 @app.post("/api/import/fcpxml")
 async def import_fcpxml(req: Request):
-    body = await req.json()
-    with LOCK:
-        proj = load_project()
+    body = await req.json(); proj, expected = _workflow_capture(body, required=False)
+    project_file = P("projects", expected["project"], "project.json"); added = []
+    def read_xml(proc_holder=None):
         def imp(path, name):
-            if not path or not os.path.exists(path): return None
-            for mid, m in proj["media"].items():
-                if os.path.abspath(m["path"]) == os.path.abspath(path): return mid
-            mid, m = ingest(path, name); proj["media"][mid] = m; return mid
-        seqs = from_fcp7_xml(body["xml"], imp); proj["sequences"].extend(seqs); save_project(proj)
-    ev = log_event({"type": "project_replaced", "actor": body.get("actor", "human"), "source": "fcpxml_import", "sequences": [s["id"] for s in seqs]}); await broadcast(ev)
-    return {"sequences": [{"id": s["id"], "name": s["name"], "clips": sum(len(t["clips"]) for t in s["tracks"])} for s in seqs]}
+            if not path or not os.path.exists(path): raise ValueError("XML source is unavailable: " + str(path))
+            for mid, media in proj["media"].items():
+                if os.path.abspath(media["path"]) == os.path.abspath(path): return mid
+            mid, media = ingest(path, name); media["workflow_import"] = True
+            proj["media"][mid] = media; added.append(media); return mid
+        return from_fcp7_xml(body["xml"], imp)
+    try: seqs = await _owned_render_thread(read_xml)
+    except (ValueError, TypeError, KeyError, OSError) as error: raise HTTPException(400, str(error)) from error
+    proj["sequences"].extend(seqs)
+    result = await _workflow_commit(proj, expected,
+        {"sequence": seqs[0]["id"], "sequences": [{"id": s["id"], "name": s["name"], "clips": sum(len(t["clips"]) for t in s["tracks"])} for s in seqs],
+         "message": f"Imported {len(seqs)} XML sequence(s)"}, "xml_import", body.get("actor", "human"))
+    for media in added: finish_ingest(media["id"], media["path"], media, project_file, media["ingest_token"])
+    return result
 
 @app.get("/api/render/{jid}")
-def render_status(jid: str): return JOBS.get(jid) or HTTPException(404)
+def render_status(jid: str):
+    with RENDER_STATE_LOCK:
+        if jid not in JOBS: raise HTTPException(404, "Render job not found")
+        from work_budget import status
+        result = copy.deepcopy(JOBS[jid]); state = status(RENDER_PROCS.get(jid))
+        if state: result['resource'] = state
+        return result
 
 @app.get("/api/render_command")
 def render_command(sequence: str = "seq1"):
-    cmd, graph = build_command(load_project(), sequence, P("renders", "preview.mp4")); return {"cmd": cmd, "graph": graph}
+    global COMMAND_CONTEXT_BUILDING
+    # Reserve before building: nested command inspection itself can encode media.
+    with COMMAND_CONTEXT_LOCK:
+        if len(COMMAND_CONTEXTS) + COMMAND_CONTEXT_BUILDING >= COMMAND_CONTEXT_LIMIT:
+            raise HTTPException(429, "Command inspection scopes are full. Release an existing scope after its consumers exit.")
+        COMMAND_CONTEXT_BUILDING += 1
+    try:
+        cmd, graph = build_command(load_project(), sequence, P("renders", "preview.mp4"))
+        scope = uuid.uuid4().hex
+        with COMMAND_CONTEXT_LOCK: COMMAND_CONTEXTS[scope] = cmd
+        return {"cmd": cmd, "graph": graph, "cwd": cmd.cwd, "scope": {"id": scope,
+                "release": f"/api/render_command/{scope}", "limit": COMMAND_CONTEXT_LIMIT,
+                "lifetime": "Retained until DELETE release; release only after command consumers exit."}}
+    finally:
+        with COMMAND_CONTEXT_LOCK: COMMAND_CONTEXT_BUILDING -= 1
+
+
+COMMAND_CONTEXTS = {}
+COMMAND_CONTEXT_LOCK = threading.Lock()
+COMMAND_CONTEXT_LIMIT = 8
+COMMAND_CONTEXT_BUILDING = 0
+
+
+@app.delete("/api/render_command/{scope}")
+def release_render_command(scope: str):
+    with COMMAND_CONTEXT_LOCK:
+        command = COMMAND_CONTEXTS.get(scope)
+        if command is None: return {"ok": False}
+        # On cleanup failure keep the scope available for an explicit retry.
+        try: command.close()
+        except Exception as error: raise HTTPException(500, str(error)) from error
+        del COMMAND_CONTEXTS[scope]
+    return {"ok": True}
 
 # ---------- proposals (agent proposes; human accepts/rejects each; every decision is a labeled training event) ----------
 @app.get("/api/proposals")
@@ -1863,41 +3606,228 @@ def proposals_list(): return load_project().get("proposals", [])
 @app.post("/api/proposals")
 async def proposals_add(req: Request):
     body = await req.json()  # {items:[{ops:[...], reason, tool}], actor:"agent", title}
-    proj0 = load_project()
-    for it in body.get("items", []):
-        problems = validate_ops(proj0, it.get("ops", []))
-        if problems: return JSONResponse({"ok": False, "errors": problems, "item": it.get("reason")}, status_code=422)
-        try:  # record the advisor's prediction alongside the proposal so decisions can be scored against it later
-            advisor_load()
-            if ADVISOR["model"] and ADVISOR["model"].n:
-                seq = next((x for x in proj0["sequences"] if x["id"] == (it.get("ops") or [{}])[0].get("sequence")), None); sd = max([c["start"] + (c["out"] - c["in_"]) / max(c.get("speed", 1), 1e-6) for t in seq["tracks"] for c in t["clips"]] + [0]) if seq else 0
-                ps = []
-                for op in it.get("ops", []):
-                    tr = next((t for t in (seq["tracks"] if seq else []) if t["id"] == op.get("track")), None); cur = None
-                    if tr: cid = op.get("clip", {}).get("id") if op.get("op") == "set_clip" else op.get("clip_id"); cur = next((c for c in tr["clips"] if c["id"] == cid), None)
-                    ps.append(ADVISOR["model"].predict(_advisor.op_features(op, {"clip": cur or {}, "seq_duration": sd, "reason": it.get("reason"), "brief": proj0.get("brief"), "track_kind": tr["kind"] if tr else None})))
-                if ps: it["advisor_p"] = round(sum(ps) / len(ps), 3); it["advisor_n"] = ADVISOR["model"].n
-        except Exception: pass
+    if not isinstance(body, dict): raise HTTPException(422, "Proposal must be an object")
+    if any(not isinstance(body.get(key, ""), str) for key in ("actor", "title")): raise HTTPException(422, "Proposal title and actor must be text")
     with LOCK:
-        proj = load_project(); pr = {"id": str(uuid.uuid4())[:8], "ts": time.time(), "actor": body.get("actor", "agent"), "title": body.get("title", "Agent proposal"),
-              "items": [{"id": str(uuid.uuid4())[:8], "ops": it["ops"], "reason": it.get("reason", ""), "tool": it.get("tool", "agent"), "status": "pending"} for it in body.get("items", [])]}
-        proj.setdefault("proposals", []).append(pr); save_project(proj)
-    ev = log_event({"type": "proposal", "actor": pr["actor"], "proposal": pr["id"], "n_items": len(pr["items"]), "title": pr["title"]}); await broadcast(ev); return pr
+        project_id = active_id(); proj0 = load_project(); require_project_context(body, project_id, proj0)
+        if not isinstance(body.get("items"), list) or not body["items"]: raise HTTPException(422, "A proposal needs at least one item")
+        for it in body.get("items", []):
+            if not isinstance(it, dict) or not isinstance(it.get("ops"), list) or not it["ops"]: raise HTTPException(422, "Each proposal item needs operations")
+            if any(isinstance(o, dict) and o.get("op") == "set_mix" for o in it["ops"]) and "_context" not in body:
+                raise HTTPException(400, "Mixer proposals require the saved project context")
+            try:
+                trial = copy.deepcopy(proj0)
+                if any((o.get("path") or "").strip("/").split("/")[0] == "proposals" for o in it["ops"]): raise ValueError("Proposal operations cannot change proposal records")
+                problems = validate_ops(trial, it["ops"])
+                if not problems:
+                    apply_ops(trial, copy.deepcopy(it["ops"]))
+                    if trial.get("proposals") != proj0.get("proposals"): raise ValueError("Proposal operations cannot change proposal records")
+                    if not all(o.get("op") == "set_mix" for o in it["ops"]): normalize_tracks(trial)
+                    parse_project(json.dumps(trial, allow_nan=False).encode("utf-8"))
+            except (RecoveryError, ValueError, TypeError, KeyError, IndexError, StopIteration, AttributeError) as error:
+                raise HTTPException(422, "Invalid proposal operations: " + str(error)[:400]) from error
+            if problems: return JSONResponse({"ok": False, "errors": problems, "item": it.get("reason")}, status_code=422)
+            try:  # record the advisor's prediction alongside the proposal so decisions can be scored against it later
+                advisor_load()
+                if ADVISOR["model"] and ADVISOR["model"].n:
+                    seq = next((x for x in proj0["sequences"] if x["id"] == (it.get("ops") or [{}])[0].get("sequence")), None); sd = max([c["start"] + (c["out"] - c["in_"]) / max(c.get("speed", 1), 1e-6) for t in seq["tracks"] for c in t["clips"]] + [0]) if seq else 0
+                    ps = []
+                    for op in it.get("ops", []):
+                        tr = next((t for t in (seq["tracks"] if seq else []) if t["id"] == op.get("track")), None); cur = None
+                        if tr: cid = op.get("clip", {}).get("id") if op.get("op") == "set_clip" else op.get("clip_id"); cur = next((c for c in tr["clips"] if c["id"] == cid), None)
+                        ps.append(ADVISOR["model"].predict(_advisor.op_features(op, {"clip": cur or {}, "seq_duration": sd, "reason": it.get("reason"), "brief": proj0.get("brief"), "track_kind": tr["kind"] if tr else None})))
+                    if ps: it["advisor_p"] = round(sum(ps) / len(ps), 3); it["advisor_n"] = ADVISOR["model"].n
+            except Exception: pass
+        proj = proj0; pr = {"id": str(uuid.uuid4())[:8], "ts": time.time(), "actor": body.get("actor", "agent"), "title": body.get("title", "Agent proposal"),
+              "items": [{"id": str(uuid.uuid4())[:8], "ops": copy.deepcopy(it["ops"]), "reason": it.get("reason", ""), "tool": it.get("tool", "agent"), "status": "pending",
+                         **{key: it[key] for key in ("advisor_p", "advisor_n") if key in it}} for it in body["items"]]}
+        proj.setdefault("proposals", []).append(pr); save_project(proj, P("projects", project_id, "project.json"))
+        context = project_context(ROOT, project_id, proj); warning = ""
+        ev = {"type": "proposal", "actor": pr["actor"], "project": project_id, "proposal": pr["id"], "n_items": len(pr["items"]), "title": pr["title"], "context": context}
+        try: log_event(ev, project_id=project_id)
+        except OSError as error: warning = "Proposal saved; event history could not be recorded: " + str(error)[:200]
+    await broadcast(ev)
+    return {**pr, "context": context, "warning": warning}
+
+
+PROPOSAL_PREVIEWS = PreviewStore()
+FRAME_SLOTS = threading.BoundedSemaphore(2)
+PROPOSAL_FRAME_SLOTS = FRAME_SLOTS
+
+
+def proposal_selection(project, pid, ids):
+    if not isinstance(ids, list) or not ids or any(not isinstance(iid, str) or not iid for iid in ids):
+        raise HTTPException(422, "Select one or more proposal items")
+    if len(set(ids)) != len(ids): raise HTTPException(422, "Proposal items must be unique")
+    proposal = next((p for p in project.get("proposals", []) if p["id"] == pid), None)
+    if not proposal: raise HTTPException(404, "Proposal not found")
+    by_id = {item["id"]: item for item in proposal["items"]}
+    if any(iid not in by_id for iid in ids): raise HTTPException(404, "Proposal item not found")
+    if any(by_id[iid].get("status") != "pending" for iid in ids):
+        raise HTTPException(409, {"code": "proposal_decided", "message": "An item was already decided. Refresh proposals before continuing."})
+    return proposal, by_id
+
+
+def prepare_proposal(project, pid, ids):
+    """One normalization pass for both direct decisions and reviewed snapshots."""
+    candidate = copy.deepcopy(project); proposal, items = proposal_selection(candidate, pid, ids)
+    ops = []; befores = {}
+    for iid in ids:
+        try:
+            captured = copy.deepcopy(items[iid]["ops"])
+            if any((o.get("path") or "").strip("/").split("/")[0] == "proposals" for o in captured): raise ValueError("Proposal operations cannot change proposal records")
+            problems = validate_ops(candidate, captured)
+            if problems: raise ValueError("; ".join(problems))
+            befores[iid] = apply_ops(candidate, captured)
+            if candidate.get("proposals") != project.get("proposals"): raise ValueError("Proposal operations cannot change proposal records")
+            ops.extend(captured)
+        except (ValueError, TypeError, KeyError, IndexError, StopIteration, AttributeError) as error:
+            raise HTTPException(422, "The proposal no longer applies: " + str(error)[:400]) from error
+    try:
+        if candidate.get("version", 1) < SCHEMA: migrate_project(candidate)
+        warnings = [] if ops and all(o.get("op") == "set_mix" for o in ops) else normalize_tracks(candidate)
+        parse_project(json.dumps(candidate, allow_nan=False).encode("utf-8"))
+    except (RecoveryError, ValueError, TypeError, KeyError, IndexError) as error:
+        raise HTTPException(422, "The proposal would leave an invalid project: " + str(error)[:400]) from error
+    return candidate, ops, befores, warnings
+
+
+def proposal_preview_error(error):
+    return HTTPException(409, {"code": "proposal_preview_changed", "message": str(error)})
+
+
+def current_proposal_preview(view_id, holder=None):
+    # Caller holds LOCK, including when capturing project identity.
+    context = project_context(ROOT, active_id(), load_project())
+    try:
+        return PROPOSAL_PREVIEWS.get(view_id, context) if holder is None else PROPOSAL_PREVIEWS.attach(view_id, context, holder)
+    except PreviewUnavailable as error: raise proposal_preview_error(error) from error
+
+
+@app.post("/api/proposals/{pid}/preview")
+async def proposal_preview(pid: str, req: Request):
+    body = await req.json()
+    if not isinstance(body, dict): raise HTTPException(422, "Preview must be an object")
+    with LOCK:
+        project_id = active_id(); project = load_project(); require_project_context(body, project_id, project)
+        ids = body.get("items")
+        candidate, ops, befores, warnings = prepare_proposal(project, pid, ids)
+        try:
+            sequences = [{"id": seq["id"], "name": seq.get("name", seq["id"]), "fps": seq["fps"], "duration": seq_total(seq)} for seq in candidate["sequences"]]
+            if any(isinstance(seq["duration"], bool) or not isinstance(seq["duration"], (int, float)) or not math.isfinite(seq["duration"]) or seq["duration"] <= 0 for seq in sequences):
+                raise ValueError("Sequence duration must be a finite positive number")
+        except (ValueError, TypeError, KeyError) as error: raise HTTPException(422, "Cannot prepare frame bounds: " + str(error)[:400]) from error
+        try:
+            view = PROPOSAL_PREVIEWS.create(pid, ids, candidate, project_context(ROOT, project_id, project), warnings,
+                                          details={"ops": ops, "befores": befores})
+        except PreviewUnavailable as error: raise HTTPException(429, str(error)) from error
+        # Review gets the actual normalized difference and sequence bounds, without
+        # installing the candidate as the browser's editable project.
+        view.pop("project")
+        view["changes"] = changes_between(project, candidate)
+        view["sequences"] = sequences
+        return {"ok": True, **view}
+
+
+@app.delete("/api/proposals/preview/{view_id}")
+def release_proposal_preview(view_id: str):
+    return {"ok": PROPOSAL_PREVIEWS.release(view_id)}
+
+
+@app.get("/api/proposals/preview/{view_id}/frame")
+def proposal_preview_frame(view_id: str, sequence: str, t: float = 0.0):
+    from work_budget import WorkBusy
+    if not math.isfinite(t) or t < 0: raise HTTPException(422, "Frame time must be finite and nonnegative")
+    if not PROPOSAL_FRAME_SLOTS.acquire(blocking=False): raise HTTPException(429, "Two proposal frames are rendering. Try this frame again shortly.")
+    holder = {"resource_wait_timeout": 5}
+    try:
+        with LOCK:
+            view = current_proposal_preview(view_id, holder)
+            seq = next((s for s in view["project"]["sequences"] if s["id"] == sequence), None)
+            if seq is None: raise HTTPException(404, "Preview sequence not found")
+            if t >= seq_total(seq): raise HTTPException(422, "Choose a frame before the end of this sequence")
+            candidate = copy.deepcopy(view["project"])
+        with RenderContext(proc_holder=holder, stall_timeout=120) as context:
+            out = context.new_file(".png")
+            render_frame(candidate, sequence, t, out, proc_holder=holder, context=context)
+            with open(out, "rb") as stream: content = stream.read()
+            with LOCK: current_proposal_preview(view_id)
+            return Response(content, media_type="image/png", headers={"Cache-Control": "no-store"})
+    except WorkBusy as error:
+        raise HTTPException(429, str(error)) from error
+    except (RuntimeError, OSError) as error:
+        if holder.get("cancelled"): raise proposal_preview_error("The preview was stopped or expired. Preview again.") from error
+        raise HTTPException(422, "Frame render failed: " + str(error)[:400]) from error
+    finally:
+        PROPOSAL_PREVIEWS.detach(view_id, holder)
+        PROPOSAL_FRAME_SLOTS.release()
+
+
+def decide_proposal_items(pid, decisions, decision, body):
+    if decision not in ("accept", "reject"):
+        raise HTTPException(422, "A proposal decision must be accept or reject")
+    if not isinstance(decisions, list) or not decisions or any(not isinstance(item, dict) or not isinstance(item.get("id"), str) for item in decisions):
+        raise HTTPException(422, "Select one or more proposal items")
+    ids = [item["id"] for item in decisions]
+    for item in decisions:
+        if not isinstance(item.get("note", ""), str) or not isinstance(item.get("reasons", []), list) or any(not isinstance(reason, str) for reason in item.get("reasons", [])):
+            raise HTTPException(422, "Decision notes and reasons must be text")
+    with LOCK:
+        project_id = active_id(); before = load_project(); require_project_context(body, project_id, before)
+        proposal_selection(before, pid, ids)
+        binding = body.get("_preview")
+        if decision == "accept" and binding is not None:
+            if not isinstance(binding, dict) or not isinstance(binding.get("id"), str): raise HTTPException(422, "Invalid preview reference")
+            view = current_proposal_preview(binding["id"])
+            if view["proposal"] != pid or view["items"] != ids or binding.get("plan") != view["plan"]:
+                raise proposal_preview_error("Select exactly the items in this preview, or prepare a new preview.")
+            proj = copy.deepcopy(view["project"])
+            ops = copy.deepcopy(view["_details"]["ops"]); befores_by_id = copy.deepcopy(view["_details"]["befores"])
+            warnings = list(view["warnings"])
+        elif decision == "accept":
+            proj, ops, befores_by_id, warnings = prepare_proposal(before, pid, ids)
+        else:
+            proj = copy.deepcopy(before); ops = []; befores_by_id = {}; warnings = []
+        pr, by_id = proposal_selection(proj, pid, ids); records = []
+        for item in decisions:
+            it = by_id[item["id"]]
+            it.update(status=decision, decided_ts=time.time(), note=item.get("note", ""), reasons=item.get("reasons", []))
+            records.append({"type": "proposal_decision", "actor": "human", "project": project_id, "proposal": pid, "item": it["id"],
+                            "decision": decision, "reason_agent": it.get("reason", ""), "reasons": it["reasons"], "note": it["note"],
+                            "ops": it["ops"], "befores": befores_by_id.get(it["id"], []), "advisor_p": it.get("advisor_p"), "advisor_n": it.get("advisor_n"), "client": body.get("client")})
+        warning = commit_edit(before, proj, project_id, {"ops": ops, "actor": "human", "reason": decision + " proposal: " + str(pr.get("title", "Agent proposal")), "ts": time.time()})
+        if decision == "accept" and binding is not None: PROPOSAL_PREVIEWS.release(binding["id"])
+        context = project_context(ROOT, project_id, proj); notices = [warning] if warning else []
+        training = P("projects", project_id, "training")
+        for event in records:
+            try: log_event(event, project_id=project_id)
+            except OSError as error: notices.append("Event history could not be recorded: " + str(error)[:200])
+            try:
+                os.makedirs(training, exist_ok=True)
+                with open(os.path.join(training, "proposal_decisions.jsonl"), "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({k: v for k, v in event.items() if k != "befores"}) + "\n")
+            except OSError as error: notices.append("Training history could not be recorded: " + str(error)[:200])
+        result = {"ok": True, "items": [by_id[iid] for iid in ids], "context": context, "warnings": warnings, "warning": "; ".join(notices)}
+        event = {"type": "proposal_decision", "project": project_id, "proposal": pid, "items": ids, "decision": decision,
+                 "actor": "human", "client": body.get("client"), "context": context}
+    return result, event
+
+
+@app.post("/api/proposals/{pid}/decide")
+async def proposal_batch_decide(pid: str, req: Request):
+    body = await req.json()
+    if not isinstance(body, dict): raise HTTPException(422, "Decision must be an object")
+    result, event = decide_proposal_items(pid, body.get("items"), body.get("decision"), body)
+    await broadcast(event)
+    return result
+
 
 @app.post("/api/proposals/{pid}/{iid}/{decision}")
 async def proposal_decide(pid: str, iid: str, decision: str, req: Request):
     body = await req.json() if req.headers.get("content-length", "0") not in ("0", "") else {}
-    with LOCK:
-        proj = load_project(); pr = next((p for p in proj.get("proposals", []) if p["id"] == pid), None)
-        if not pr: raise HTTPException(404)
-        it = next((i for i in pr["items"] if i["id"] == iid), None)
-        if not it: raise HTTPException(404)
-        befores = apply_ops(proj, it["ops"]) if decision == "accept" else []
-        it["status"] = decision; it["decided_ts"] = time.time(); it["note"] = body.get("note", ""); it["reasons"] = body.get("reasons", []); save_project(proj)
-    ev = log_event({"type": "proposal_decision", "actor": "human", "proposal": pid, "item": iid, "decision": decision, "reason_agent": it["reason"], "reasons": it["reasons"], "note": it["note"], "ops": it["ops"], "befores": befores, "advisor_p": it.get("advisor_p"), "advisor_n": it.get("advisor_n")})
-    os.makedirs(PP("training"), exist_ok=True)
-    with open(PP("training", "proposal_decisions.jsonl"), "a") as f: f.write(json.dumps({k: v for k, v in ev.items() if k != "befores"}) + "\n")
-    await broadcast({k: v for k, v in ev.items() if k not in ("befores",)}); return it
+    result, event = decide_proposal_items(pid, [{"id": iid, "note": body.get("note", ""), "reasons": body.get("reasons", [])}], decision, body)
+    await broadcast(event)
+    return {**result["items"][0], **{key: result[key] for key in ("ok", "context", "warnings", "warning")}}
 
 # ---------- captions / interchange / frames ----------
 @app.post("/api/captions/import")
@@ -1908,70 +3838,206 @@ async def captions_import(req: Request):
     ev = log_event({"type": "ops", "actor": body.get("actor", "human"), "tool": "captions_import", "reason": f"{len(caps)} captions", "ops": []}); await broadcast(ev); return {"count": len(caps)}
 
 @app.get("/api/captions/export")
-def captions_export(sequence: str = "seq1"):
-    proj = load_project(); seq = next(s for s in proj["sequences"] if s["id"] == sequence)
+def captions_export(sequence: str = "seq1", context: Optional[str] = None):
+    with LOCK:
+        proj = load_project()
+        if context is not None:
+            try: expected = json.loads(context)
+            except ValueError: raise HTTPException(400, "Invalid project context") from None
+            require_project_context({"_context": expected}, active_id(), proj)
+        seq = next((s for s in proj["sequences"] if s["id"] == sequence), None)
+        if seq is None: raise HTTPException(404, "Sequence not found")
     from fastapi.responses import PlainTextResponse; return PlainTextResponse(captions_to_srt(seq.get("captions") or []), media_type="text/plain")
 
 @app.get("/api/export/fcpxml")
 def export_fcpxml(sequence: str = "seq1"):
-    from fastapi.responses import Response; return Response(to_fcp7_xml(load_project(), sequence), media_type="application/xml", headers={"Content-Disposition": f"attachment; filename={sequence}.xml"})
+    try: xml = to_fcp7_xml(load_project(), sequence)
+    except (ValueError, StopIteration) as error: raise HTTPException(400, str(error) or "Sequence not found") from error
+    return Response(xml, media_type="application/xml", headers={"Content-Disposition": f"attachment; filename={sequence}.xml"})
 
 @app.get("/api/export/otio")
 def export_otio(sequence: str = "seq1"):
     return JSONResponse(to_otio(load_project(), sequence), headers={"Content-Disposition": f"attachment; filename={sequence}.otio"})
 
 @app.get("/api/frame")
-def frame(sequence: str = "seq1", t: float = 0.0):
-    os.makedirs(P("renders"), exist_ok=True); out = P("renders", f"frame_{sequence}_{t:.3f}.png".replace(".", "_", 1))
-    render_frame(load_project(), sequence, t, out); return FileResponse(out, media_type="image/png")
+def frame(sequence: str = "seq1", t: float = 0.0, context: Optional[str] = None, media: Optional[str] = None):
+    from work_budget import WorkBusy
+    from timeline_time import display_frame, from_frames
+    from render import chunk_key
+    if not math.isfinite(t) or t < 0: raise HTTPException(422, "Frame time must be finite and nonnegative")
+    if not FRAME_SLOTS.acquire(blocking=False): raise HTTPException(429, "Two frames are rendering. Try this frame again shortly.")
+    try:
+        with LOCK:
+            project = load_project(); pid = active_id()
+            if context is not None:
+                try: expected = json.loads(context)
+                except (ValueError, TypeError): raise HTTPException(400, "Invalid project context") from None
+                require_project_context({"_context": expected}, pid, project)
+            captured = project_context(ROOT, pid, project)
+            if media is not None:
+                from frame_source import source_project
+                project = source_project(project, media); sequence = 'source'
+            seq = next((s for s in project["sequences"] if s["id"] == sequence), None)
+            if seq is None: raise HTTPException(404, "Sequence not found")
+            if t >= seq_total(seq): raise HTTPException(422, "Choose a frame before the end of this sequence")
+            index = display_frame(t, seq["fps"])
+            project = copy.deepcopy(project)
+            seq = next(s for s in project["sequences"] if s["id"] == sequence)
+        signature = chunk_key(project, seq, {"color_processing": "rgb"})
+        with RenderContext(proc_holder={"resource_wait_timeout": 5}, stall_timeout=120) as owned:
+            out = owned.new_file(".png")
+            render_frame(project, sequence, t, out, context=owned)
+            with open(out, "rb") as stream: content = stream.read()
+            if chunk_key(project, seq, {"color_processing": "rgb"}) != signature:
+                raise HTTPException(409, "A source or render resource changed. Request this frame again.")
+            with LOCK: require_project_context({"_context": captured}, active_id(), load_project())
+            return Response(content, media_type="image/png", headers={"Cache-Control": "no-store",
+                "Content-Disposition": f'inline; filename="frame_{index:08d}.png"',
+                "X-Filmocity-Frame": str(index), "X-Filmocity-Time": str(from_frames(index, seq["fps"]))})
+    except WorkBusy as error:
+        raise HTTPException(429, str(error)) from error
+    except (ValueError, RuntimeError, OSError) as error:
+        raise HTTPException(422, "Frame render failed: " + str(error)[:400]) from error
+    finally:
+        FRAME_SLOTS.release()
+
+@app.get("/api/projects/versions")
+def saved_versions(kind: str = "snapshots"):
+    with LOCK:
+        pid = active_id(); proj = load_project()
+        try: catalog = list_versions(P("projects", pid, "project.json"), kind)
+        except RecoveryError as error: raise HTTPException(422, str(error)) from error
+        return {"kind": kind, "context": project_context(ROOT, pid, proj), **catalog}
+
+async def restore_saved_version(body, kind):
+    with LOCK:
+        pid = active_id(); before = load_project(); require_project_context(body, pid, before)
+        project_file = P("projects", pid, "project.json")
+        name = body.get("name" if kind == "snapshots" else "file")
+        if "_context" in body and not isinstance(body.get("sha256"), str):
+            raise HTTPException(422, "Choose a version from a refreshed list before restoring")
+        try:
+            document, sha = read_version(project_file, kind, name, body.get("sha256"))
+            # Preserve an explicit checkpoint even after the finite undo history expires.
+            preserved = write_snapshot(project_file, before, "before_" + kind.rstrip("s") + "_restore")
+        except RecoveryConflict as error: raise HTTPException(409, str(error)) from error
+        except FileNotFoundError as error: raise HTTPException(404, str(error)) from error
+        except (RecoveryError, TypeError, ValueError) as error: raise HTTPException(422, str(error)) from error
+        warning = commit_edit(before, document, pid, {"actor": body.get("actor", "human"), "reason": "restore " + kind.rstrip("s") + ": " + name, "ts": time.time()}, protected_backup=name if kind == "backups" else None)
+        context = project_context(ROOT, pid, document)
+        ev = {"type": "project_replaced", "project": pid, "source": kind.rstrip("s") + "_restore", "file": name,
+              "actor": body.get("actor", "human"), "client": body.get("client"), "context": context}
+        try: log_event(ev, project_id=pid)
+        except OSError as error: warning = (warning + "; " if warning else "") + "Restored, but event history could not be recorded: " + str(error)[:200]
+    try: await broadcast(ev)
+    except Exception as error: warning = (warning + "; " if warning else "") + "Restored, but notification failed: " + str(error)[:200]
+    return {"ok": True, "context": context, "file": name, "sha256": sha, "preserved": preserved["file"], "warning": warning}
 
 @app.get("/api/snapshots")
 def snapshots_list():
-    d = PP("snapshots")
-    if not os.path.isdir(d): return []
-    out = []
-    for f in sorted(os.listdir(d)):
-        try: ts = float(f.split("_")[0])
-        except ValueError: ts = os.path.getmtime(os.path.join(d, f))
-        out.append({"file": f, "ts": ts, "label": f.split("_", 1)[1].rsplit(".", 1)[0] if "_" in f else f})
-    return out
+    return list(reversed(saved_versions("snapshots")["versions"]))
 
 @app.get("/api/snapshots/get")
 def snapshots_get(file: str):
-    f = PP("snapshots", os.path.basename(file))
-    if not os.path.exists(f): raise HTTPException(404)
-    return json.load(open(f))
+    with LOCK:
+        pid = active_id()
+        try: document, _ = read_version(P("projects", pid, "project.json"), "snapshots", file)
+        except FileNotFoundError as error: raise HTTPException(404, str(error)) from error
+        except RecoveryError as error: raise HTTPException(422, str(error)) from error
+        return document
 
 @app.post("/api/snapshots/restore")
 async def snapshots_restore(req: Request):
-    body = await req.json(); p = PP("snapshots", os.path.basename(body["name"]))
-    if not os.path.exists(p): raise HTTPException(404)
-    with LOCK: proj = json.load(open(p)); save_project(proj)
-    ev = log_event({"type": "project_replaced", "actor": "human", "source": "restore:" + body["name"]}); await broadcast(ev); return {"ok": True}
+    return await restore_saved_version(await req.json(), "snapshots")
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
-    tok = TOKEN["value"]
-    if tok and (websocket.query_params.get("token") != tok and websocket.cookies.get("filmocity_token") != tok): await websocket.close(code=4401); return
+    denied = access_error(websocket, TOKEN["value"])
+    if denied: await websocket.close(code=4401 if denied[0] == 401 else 4403); return
     await websocket.accept(); CLIENTS.append(websocket)
     try:
         while True: await websocket.receive_text()
     except WebSocketDisconnect:
+        pass
+    finally:
         if websocket in CLIENTS: CLIENTS.remove(websocket)
 
+def restore_render_history():
+    from job_history import restore
+    with RENDER_STATE_LOCK:
+        # Initialization only: existing live jobs must not become interrupted.
+        if JOBS or RENDER_WORKERS or not RENDER_Q.empty():
+            raise RuntimeError("Cannot restore export history over a live render queue.")
+        JOBS.update(restore(ROOT))
+
+
+def _shutdown_workers(timeout=10):
+    """Cooperative retirement with one shared deadline, including idle workers."""
+    import logging
+    from job_history import remember
+    from project_lifecycle import COPY_WORKER
+    deadline = time.monotonic() + max(0, timeout)
+    SHUTDOWN.set()
+    with RENDER_STATE_LOCK:
+        workers = list(RENDER_WORKERS)
+        for holder in RENDER_PROCS.values(): holder["cancelled"] = True
+        for job in JOBS.values():
+            if job.get("status") == "queued":
+                job.update(status="error", error="Stopped before starting. Retry explicitly.", finished=time.time())
+                try: remember(ROOT, job)
+                except Exception as error: logging.getLogger(__name__).warning("Shutdown receipt unavailable: %s", error)
+        while True:
+            try: RENDER_Q.get_nowait()
+            except _queue.Empty: break
+            else: RENDER_Q.task_done()
+        for _ in workers: RENDER_Q.put_nowait(None)
+    # Signal every operation before joining any one worker, so independent
+    # encoder/copy/speech phases can retire concurrently.
+    COPY_WORKER.shutdown(0)
+    tasks_stopped = True
+    if TASKS is not None:
+        tasks_stopped = TASKS.shutdown(max(0, deadline-time.monotonic()))
+    copy_stopped = COPY_WORKER.shutdown(max(0, deadline-time.monotonic()))
+    for thread in [AUTOSAVE_THREAD, *workers]: thread.join(max(0, deadline-time.monotonic()))
+    unfinished = [thread.name for thread in [AUTOSAVE_THREAD, *workers] if thread.is_alive()]
+    if not copy_stopped: unfinished.append("Filmocity project copy")
+    if not tasks_stopped: unfinished.append("Filmocity background tasks")
+    if unfinished:
+        message = "Shutdown deadline reached; still stopping: " + ", ".join(unfinished)
+        logging.getLogger(__name__).warning(message)
+        raise RuntimeError(message)
+    return {"ok": True, "unfinished": []}
+
+
+@app.on_event("shutdown")
+async def shutdown_background_tasks():
+    return await asyncio.to_thread(_shutdown_workers, 10)
+
+
 def mount():
+    global ROOT, TASKS
+    from export_storage import export_static_files
+    ROOT = os.path.realpath(os.path.abspath(os.path.expanduser(ROOT)))
+    # Own the whole library before migrations, recovery, or runtime directories.
+    hold_workspace(ROOT)
+    os.environ["FILMOCITY_ROOT"] = ROOT
+    os.environ["FILMOCITY_DATA"] = ROOT
     for d in ("thumbs", "renders", "media", "proxies", "projects"): os.makedirs(P(d), exist_ok=True)
     migrate_legacy()
-    os.makedirs(P("fonts"), exist_ok=True); app.mount("/fonts", StaticFiles(directory=P("fonts")), name="fonts"); app.mount("/thumbs", StaticFiles(directory=P("thumbs")), name="thumbs"); app.mount("/renders", StaticFiles(directory=P("renders")), name="renders"); app.mount("/proxies", StaticFiles(directory=P("proxies")), name="proxies")
+    restore_render_history()
+    TASKS = TaskManager(ROOT, {"cover": _task_cover_workflow, "recipe": _task_recipe_workflow, "audio_analysis": _task_audio_workflow, "sync": _task_audio_sync, "render_replace": _task_render_replace, "analysis": _task_media_analysis, "media": _task_prepare_media, "transcribe": _task_transcribe, "package": _task_package, "package_import": _task_package, "collect": _task_collect})
+    os.makedirs(P("fonts"), exist_ok=True); app.mount("/fonts", StaticFiles(directory=P("fonts")), name="fonts"); app.mount("/thumbs", StaticFiles(directory=P("thumbs")), name="thumbs"); app.mount("/renders", export_static_files(P("renders")), name="renders"); app.mount("/proxies", StaticFiles(directory=P("proxies")), name="proxies")
     app.mount("/static", StaticFiles(directory=FRONT), name="static")
     if os.path.isdir(ASSETS): app.mount("/assets", StaticFiles(directory=ASSETS), name="assets")
     if os.path.isdir(DOCS): app.mount("/docs", StaticFiles(directory=DOCS, html=True), name="docs")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--root", default=ROOT); ap.add_argument("--port", type=int, default=8787); ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--token", default=None, help="require this access token (use with --host 0.0.0.0 to share on a LAN)")
-    a = ap.parse_args(); ROOT = a.root; os.makedirs(ROOT, exist_ok=True); os.environ["FILMOCITY_DATA"] = os.path.abspath(ROOT); mount()
+    a = ap.parse_args(); ROOT = a.root; mount()
     if a.token: TOKEN["value"] = a.token; print(f"access token set — open http://{a.host}:{a.port}/?token={a.token}")
     elif a.host not in ("127.0.0.1", "localhost"): TOKEN["value"] = uuid.uuid4().hex[:16]; print(f"LAN mode: generated access token — open http://<this-machine>:{a.port}/?token={TOKEN['value']}")
-    uvicorn.run(app, host=a.host, port=a.port, log_level="warning")
+    from http_protocol import FilmocityH11Protocol
+    uvicorn.run(app, host=a.host, port=a.port, log_level="warning", timeout_graceful_shutdown=REQUEST_SHUTDOWN_GRACE,
+                http=FilmocityH11Protocol)
 else:
-    os.makedirs(ROOT, exist_ok=True); mount()
+    mount()

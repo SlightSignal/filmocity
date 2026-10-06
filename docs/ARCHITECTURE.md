@@ -1,3 +1,22 @@
+# Current modernization direction — October 2026
+
+The implementation/evidence record is [MODERNIZATION.md](MODERNIZATION.md). The older roadmap below is historical; its dates and claims of exactness are not release acceptance.
+
+Windows x64 is the current release target. Linux remains a development host; other operating-system releases are deferred. Keep source portability where practical, while binding release claims to the exact Windows candidate and native evidence.
+
+The guided creator workflow uses framework-independent builders in `backend/editing_workflow.py`, guarded routes and a dedicated frontend transaction adapter. It commits each mutation and exact history in one operation. Long speech/copy/probe work finishes outside the project lock and revalidates before commit. The panel derives readiness from project data and routes delivery through existing export jobs. See [GUIDED-WORKFLOW.md](GUIDED-WORKFLOW.md) for product behavior and limits.
+
+The current browser preview uses video elements, Canvas/WebGL and Web Audio. FFmpeg handles probing-related media workflows, proxies, frame/sequence renders and exports through the local backend. The render bar describes coverage; it should not repeatedly prepare every segment merely because the timeline was redrawn. The October 4 implementation gives it bounded viewport requests, local drawing reuse and request-local indexed sequence slicing.
+
+Keep FFmpeg as the media/export engine while improving scheduling, responsiveness and the independently implemented preview. Its [documented pipeline](https://ffmpeg.org/ffmpeg.html) separates demuxing, decoding, filtering, encoding and muxing; accelerating an encoder alone does not establish end-to-end editing performance. A future browser decoder experiment can use [WebCodecs](https://www.w3.org/TR/webcodecs/), whose codec support and resource lifecycle must be checked on the actual browser/WebView2 runtime. Neither alternative has been implemented or benchmarked by this stage.
+
+Next engineering priorities and acceptance evidence:
+
+1. **Runtime media capabilities.** Identify the exact FFmpeg build and test candidate encoders with real short encodes. A listed hardware encoder alone is not proof of working hardware/driver access. The first bounded H.264/HEVC probe and format-aware choices are implemented; failures are explicit and never silently substitute software. Next, verify image/audio/metadata fidelity and cancellation on Windows.
+2. **Interactive playback and fair media scheduling.** Queued export destinations and input values are now isolated; worker creation is serialized. Export receipts now restore completed history and mark interrupted jobs without requeueing. Native restart acceptance, history scaling, resumable work, ingest/analysis scheduling and live performance work remain. Measure seek latency, frame presentation, dropped frames, decoding memory and competing ingest/export workloads. Bound queues and retire obsolete work. Introduce a new decode path only with a working fallback, clear resource ownership and real browser/native evidence.
+3. **Preview/export consistency.** Define effect ordering, alpha, color and timing semantics shared across implementations, backed by full-frame and audio comparisons. Track mattes currently require rendered playback. RGB buffers do not constitute HDR or high-bit-depth color management.
+4. **Release acceptance.** Build an isolated candidate and verify launch, import/edit, save/reopen, export/download, cancellation and shutdown against its exact Windows artifact. Maintain old-project compatibility and preserve the original release bundle.
+
 # Architecture and roadmap to Premiere-class capability
 
 ## Now (v0.9)

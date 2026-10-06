@@ -1,0 +1,17 @@
+#pane-tasks { padding: 14px; overflow: auto; user-select: text; }
+#pane-tasks h2 { font-size: 17px; margin: 4px 0 12px; }
+.task-row { padding: 12px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.task-row h3 { font-size: 13px; margin: 0 0 5px; }
+.task-row p { margin: 6px 0; line-height: 1.5; }
+.task-note { color: var(--dim); line-height: 1.5; }
+.task-error { color: #ffb2aa; }
+.task-controls { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+.task-controls button { padding: 6px 9px; }
+.task-controls a { color: var(--accent2); }
+.task-row progress { width: 100%; height: 8px; accent-color: var(--accent2); }
+.task-status:empty { display: none; }
+.task-result-preview { margin: 12px 0; padding: 10px; border: 1px solid var(--line); border-radius: 4px; }
+.task-result-preview h3 { margin: 0 0 8px; font-size: 13px; }
+.task-result-preview audio { max-width: 100%; }
+.task-render-picture { display: block; max-width: 100%; max-height: 320px; background: repeating-conic-gradient(#333 0% 25%, #555 0% 50%) 50% / 16px 16px; }
+.caption-pages { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }

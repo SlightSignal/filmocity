@@ -1,0 +1,48 @@
+/* Keep the editor's visual language while giving the guided path room to read. */
+#pane-workflow.wf { padding: 16px; user-select: text; overflow: auto; }
+.wf h2 { font-size: 18px; margin: 4px 0 14px; overflow-wrap: anywhere; }
+.wf h3 { font-size: 15px; margin: 16px 0 10px; }
+.wf-eyebrow { margin: 0; color: var(--accent2); font-size: 10px; font-weight: 700; letter-spacing: .12em; }
+.wf-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+.wf-steps button { min-height: 32px; padding: 5px; }
+.wf-steps [aria-current=step] { border-color: var(--accent2); background: #253b51; color: #fff; }
+.wf-note { color: var(--dim); line-height: 1.55; margin: 10px 0; }
+.wf-field { display: grid; gap: 5px; margin: 12px 0; }
+.wf-field input:not([type=checkbox]), .wf-field select { width: 100%; min-height: 30px; }
+.wf-field input[type=file] { padding: 6px; }
+.wf-check { display: flex; align-items: flex-start; gap: 8px; padding: 8px; line-height: 1.5; border-bottom: 1px solid var(--line); cursor: pointer; overflow-wrap: anywhere; }
+.wf-check input { margin-top: 3px; flex-shrink: 0; }
+.wf-list { max-height: 235px; overflow: auto; border: 1px solid var(--line); border-radius: 5px; }
+.wf-passages { max-height: 350px; }
+.wf-list:empty { display: none; }
+.wf-list > button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+.wf-passage { padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.wf-passage .wf-check { border: 0; }
+.wf-passage > button { margin-left: 8px; font-size: 11px; color: var(--accent2); }
+.wf-count { color: var(--accent2); margin: 12px 0 6px; }
+.wf-body { border: 0; padding: 0; margin: 0; min-width: 0; }
+.wf-body > div > button { margin: 4px 4px 4px 0; padding: 7px 9px; }
+.wf button:disabled, .wf fieldset:disabled { opacity: .55; cursor: default; }
+.wf-message { padding: 10px; background: #203529; border: 1px solid #3f6950; border-radius: 5px; line-height: 1.5; overflow-wrap: anywhere; }
+.wf-message:empty { display: none; }
+.wf-error { background: #43282a; border-color: #815457; }
+.wf-order-row { display: flex; gap: 4px; margin: 4px 0; align-items: center; }
+.wf-order-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.wf-footer { display: flex; justify-content: space-between; border-top: 1px solid var(--line); margin-top: 18px; padding-top: 12px; gap: 5px; }
+.wf a { display: block; margin: 12px 0; color: var(--accent2); }
+#btnWorkflow { border-color: var(--accent2); color: var(--accent2); }
+@media (prefers-reduced-motion: reduce) { .wf * { scroll-behavior: auto; } }
+.wf-transcript-tools, .wf-pager { display: flex; gap: 5px; flex-wrap: wrap; margin: 8px 0; }
+.wf-pager { justify-content: space-between; }
+.wf-confidence { display: inline-block; margin: 4px 8px; color: #f1c877; font-size: 11px; }
+.wf-word-editor:not(:empty) { border: 1px solid var(--accent2); border-radius: 5px; margin: 12px 0; padding: 10px; }
+.wf-word-editor h4 { margin: 0 0 8px; font-size: 13px; }
+.wf-word-row { display: grid; grid-template-columns: 26px minmax(60px, 1fr) 30px; align-items: center; gap: 5px; margin: 6px 0; }
+.wf-word-row .wf-check { padding: 0; border: 0; }
+.wf-word-row .wf-check span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.wf-word-row input[type=text] { width: 100%; min-height: 30px; }
+.wf-word-row button { padding: 5px; }
+.wf-correction-drafts { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 10px 0; margin: 12px 0; }
+.wf-correction-drafts summary { cursor: pointer; }
+.wf-correction-draft { border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+.wf-correction-draft button { margin: 2px; }

@@ -37,13 +37,17 @@ def main():
             c = cr.place(music["id"], "A2", start=start, in_=sg["in"], out=sg["out"], reason=f"music remixed to {t:.1f}s at {rx['bpm']} BPM", note="bed remixed on bar boundaries", audio={"gain_db": -8, "linked": True}, audio_transition_in={"type": "constant_power", "duration": 0.4} if prev else None); start += sg["out"] - sg["in"]; prev = c
     cr.snapshot("agent_proposal"); print(f"rough cut laid: {len(shots)} shots, {t:.1f}s")
     # refinements as proposals, scored first
-    first = sorted(cr.sequence()["tracks"][1]["clips"], key=lambda c: c["start"])[0] if len(cr.sequence()["tracks"]) > 1 and cr.sequence()["tracks"][1]["clips"] else None
+    state = cr.project_state()
+    seq = next((s for s in state["project"]["sequences"] if s["id"] == seq["id"]), None)
+    if seq is None: raise FilmocityError("The sequence changed; review the current project before proposing refinements")
+    track = next((track for track in seq["tracks"] if track["id"] == "V1"), None)
+    first = min(track["clips"], key=lambda c: c["start"]) if track and track["clips"] else None
     items = []
     if first:
         ops = [{"op": "set_clip", "sequence": seq["id"], "track": "V1", "clip": {"id": first["id"], "out": round(first["out"] - 0.4, 3)}}]; sc = cr.score(ops, "tighter hook")[0]; print(f"advisor on tightening the hook: {sc}")
         items.append({"ops": ops, "reason": "hook runs 0.4 s past the beat; tighten" + (" (advisor expects a rejection — proposing anyway, tell me why if so)" if sc.get("p_accept") is not None and sc["p_accept"] < 0.3 else "")})
     items.append({"ops": [{"op": "set_clip", "sequence": seq["id"], "track": "V2", "clip": {"id": uuid.uuid4().hex[:8], "media_id": None, "start": max(0.0, t - 2.5), "in_": 0, "out": 2.5, "speed": 1, "title": {"text": (brief.get("client") or "brand") + ".com", "size": int(seq["height"] * 0.045), "color": "white", "valign": "bottom", "y": -int(seq["height"] * 0.08)}, "transform": {"opacity": 1}}}], "reason": "CTA URL on the end card"})
-    pid = cr.propose("Rough cut refinements", items); print(f"proposed {len(items)} item(s) as {pid}; waiting for the human…")
+    pid = cr.propose("Rough cut refinements", items, context=state["context"]); print(f"proposed {len(items)} item(s) as {pid}; waiting for the human…")
     dec = cr.wait_for_decisions(pid, timeout=float(os.environ.get("FILMOCITY_WAIT", "20")))
     print("decisions:", dec or "(none yet — leave them for the human)")
     if dec: print("retrained:", cr.retrain()["examples"], "examples;", "top preferences:", [(r["pattern"], r["acceptance"]) for r in cr.preferences()["rules"][:3]])

@@ -6,11 +6,11 @@ Start with a finished sample, then make a short cut from your footage. Allow ext
 
 ### 1. Install once, then launch
 
-On Windows, install **Python 3.10 or newer from python.org**, checking **Add python.exe to PATH**. Download [Filmocity](https://github.com/SlightSignal/filmocity) with **Code → Download ZIP**, extract it, and open the extracted Filmocity folder.
+For an already installed native Windows build, open its Filmocity shortcut. Source setup is a separate path: use the approved source handoff and **standard, GIL-enabled CPython 3.13.16 Windows x64** for the pinned RC environment. The verified source repository is [Filmocity on GitHub](https://github.com/SlightSignal/filmocity); use its reviewed tools-only source. Source publication and native binary distribution have separate scopes. See [release readiness](RELEASE_READINESS.md) and [build/setup instructions](../packaging/README.md).
 
-Double-click **Install Filmocity.bat** and let installation finish. Then double-click **Filmocity.bat**. It opens your browser at **http://localhost:8787**. This is Filmocity running on your computer; there is no Filmocity account to create. Keep its launcher window open while editing.
+For source use, supply **FFmpeg and ffprobe** from a reviewed distribution in the source folder's `bin/` directory or on PATH, keeping its licenses and corresponding-source information. Setup no longer downloads rolling FFmpeg builds. Then run **Install Filmocity.bat** deliberately in a fresh source environment: it selects the standard 3.13 series, requires patch 16 or newer/x64, and installs the hash-locked Windows Python dependencies. Keep older environments and receipts as historical evidence. Open **Filmocity.bat** afterward. The source launcher opens the local browser editor; the native package uses its own window. Use the address reported by that launch rather than assuming port 8787, and retain the intended project library. No Filmocity account is needed. Keep a source launcher's window open while editing.
 
-Open **Help → System Check** if something is missing. Automatic transcription is optional, so you can start without installing auto-captions.
+Open **Help → System Check** if something is missing. Automatic transcription is optional. Its source-only `--with-whisper` install is outside the reviewed dependency locks; start without it for the pinned environment.
 
 ### 2. See a finished cut
 

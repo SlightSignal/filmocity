@@ -22,7 +22,14 @@ SOFTWARE.
 
 The bundled DejaVu fonts (assets/fonts/) are distributed under the DejaVu
 Fonts License (see assets/fonts/LICENSE-DejaVu.txt), not this license.
-The installer downloads FFmpeg at first run; FFmpeg is licensed under the
-LGPL/GPL by its own authors and is not part of this Software.
+This MIT license covers Filmocity's original source and assets unless a separate
+notice applies. It does not replace the licenses of third-party components.
+Windows packages can bundle Python, Python packages, native runtime libraries,
+FFmpeg and ffprobe. Each retains its own copyright and license. Source use can
+instead supply tools separately. The exact distributed FFmpeg build determines
+its applicable license; do not infer it from Filmocity's MIT license.
+Retain THIRD_PARTY_NOTICES.md and the applicable licenses/ texts with any
+distribution that uses those components. See docs/RELEASE_READINESS.md for the
+exact component-notice and provenance gate before public binary distribution.
 Premiere Pro is a trademark of Adobe Inc.; Filmocity is an independent project
 and contains no Adobe code or assets.

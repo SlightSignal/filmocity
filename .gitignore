@@ -1,17 +1,75 @@
-# environments and build artifacts
-.venv/
+# Environments, dependencies and generated build output.
+.venv*/
+node_modules/
 build/
 dist/
 __pycache__/
-*.pyc
-
-# fetched at install time (launcher/bootstrap.py), never committed
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
 bin/
+packaging/*.spec
 
-# runtime state
-filmocity_data/
+# Project libraries, machine-local installation records and test output.
+/filmocity_data/
+/cutroom_data/
+/.render-context-tests/
+/.render-queue-lifecycle-tests/
+/.command-scope-tests/
+/.png-publication-tests/
+/.project-save-tests/
+/.test-tmp/
+.filmocity.lock
 launcher/install.log
 launcher/installed.json
 *.log
 *.bak
-packaging/*.spec
+
+# Private source-adjacent stores and local release companions are never public.
+/data/
+/media/
+/projects/
+/clients/
+/client-work/
+/client-data/
+/campaigns/
+/private/
+/renders/
+/exports/
+/cache/
+/training/
+/snapshots/
+/EVIDENCE/
+/LOCAL-REVIEW-BINARY/
+/release-handoff*/
+/wheelhouse/
+*.bundle
+*.zip
+
+# Secrets and signing identities. Review the actual selected files as well.
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+
+# The old transfer manifest describes a frozen handoff, not the current tree.
+/handoff-manifest.json
+
+# Preserve the complete historical benchmark tree locally. Commit only the
+# explicit fixtures/harness in packaging/release-inputs.json. Directories are
+# traversable so the exact nested exceptions below can be included.
+/benchmarks/**
+!/benchmarks/**/
+!/benchmarks/README.md
+!/benchmarks/timeline.cjs
+!/benchmarks/timeline-harness.cjs
+!/benchmarks/baselines/chunk-sequence-before.py
+!/benchmarks/baselines/editing-workflow-before.py
+!/benchmarks/baselines/timeline-before.js
+!/benchmarks/baselines/timeline-before.json
+!/benchmarks/story-editing/measure.py
+!/benchmarks/timeline-core/legacy-drag.txt
+!/benchmarks/timeline-core/legacy-snap.txt
+!/benchmarks/source-replacement-sync/reviews/m1k-audio-audit/media/quiet_then_loud.wav
+!/benchmarks/source-replacement-sync/reviews/m1k-audio-audit/media/silence.wav
